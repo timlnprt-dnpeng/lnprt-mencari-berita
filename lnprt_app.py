@@ -14,6 +14,7 @@ from datetime import datetime
 from typing import List, Dict, Set, Tuple, Any, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
+import requests
 from pygooglenews import GoogleNews
 from googlenewsdecoder import gnewsdecoder
 from st_aggrid import AgGrid, GridOptionsBuilder, JsCode
@@ -30,6 +31,14 @@ LOGO_PATH       = os.path.join(_HERE, "Logo.png")
 gn         = GoogleNews(lang="id", country="ID")
 DATE_DELTA = dt.timedelta(days=30)
 UMUM       = "Umum"
+DELAY_REQ  = 3  # Detik delay antar request untuk hindari blokir
+MAX_WORKERS = 5  # Worker paralel (Streamlit Cloud: 2 vCPUs)
+
+# NewsAPI.org - pindah ke st.secrets saat hosting di Streamlit Cloud
+try:
+    NEWS_API_KEY = st.secrets["NEWS_API_KEY"]
+except Exception:
+    NEWS_API_KEY = "4cf8032e0a0d4107a68443615aefd46a"
 
 # ============================================================
 # 1. LOAD DATA REFERENSI
@@ -226,19 +235,108 @@ def show_aggrid(df: pd.DataFrame):
 # ============================================================
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def cached_gnews_search(keyword: str,
-                         start_date: dt.date,
-                         end_date: dt.date,
-                         wilayah_term: str = "") -> List[Dict]:
+def cached_bing_search(keyword: str,
+                       start_date: dt.date,
+                       end_date: dt.date,
+                       wilayah_term: str = "") -> List[Dict]:
+    from bs4 import BeautifulSoup
+    import urllib.parse
+
+    all_entries: List[Dict] = []
+    errors: List[str] = []
+    seen_urls: Set[str] = set()
+
+    # Build query - natural search without restrictive quotes
+    if wilayah_term:
+        q_base = f'{keyword} {wilayah_term}'.strip()
+    else:
+        q_base = keyword
+
+    # Headers to mimic real browser
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'id-ID,id;q=0.9,en;q=0.8',
+    }
+
+    # Use Bing News - more reliable than Google News
+    try:
+        encoded_query = urllib.parse.quote(q_base)
+        url = f'https://www.bing.com/news/search?q={encoded_query}&setlang=id-ID'
+
+        for attempt in range(3):
+            try:
+                response = requests.get(url, headers=headers, timeout=15)
+                if response.status_code == 200:
+                    soup = BeautifulSoup(response.text, 'html.parser')
+
+                    # Bing News article selectors
+                    articles = soup.select('div.news-card, div.newsitem')
+
+                    for article in articles:
+                        try:
+                            # Extract title and link
+                            title_elem = article.select_one('a.title, h3 a, .title a')
+                            if not title_elem:
+                                continue
+
+                            title = title_elem.text.strip()
+                            link = title_elem.get('href', '')
+
+                            if not link or link in seen_urls:
+                                continue
+
+                            # Get source
+                            src_elem = article.select_one('.source, .provider, cite')
+                            src = src_elem.text.strip() if src_elem else "-"
+
+                            # Get published date
+                            date_elem = article.select_one('.date, .timestamp, time')
+                            published = date_elem.text.strip() if date_elem else ""
+
+                            seen_urls.add(link)
+                            all_entries.append({
+                                "title": title,
+                                "published": published,
+                                "link": link,
+                                "source": src
+                            })
+                        except Exception:
+                            continue
+
+                    break  # Success, exit retry loop
+
+                else:
+                    errors.append(f"Bing News HTTP {response.status_code}")
+
+            except Exception as exc:
+                if attempt == 2:  # Last attempt
+                    errors.append(f"Bing News: {type(exc).__name__}: {exc}")
+                time.sleep(2 ** attempt)
+
+        time.sleep(DELAY_REQ)
+
+    except Exception as exc:
+        errors.append(f"Search error: {type(exc).__name__}: {exc}")
+
+    return all_entries, errors
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def cached_google_search(keyword: str,
+                          start_date: dt.date,
+                          end_date: dt.date,
+                          wilayah_term: str = "") -> List[Dict]:
+    """Google News search menggunakan pygooglenews"""
     all_entries: List[Dict] = []
     errors: List[str] = []
     current = start_date
-    q_base = f'"{keyword}" "{wilayah_term}"' if wilayah_term else f'"{keyword}"'
+    q_base = f'{keyword} {wilayah_term}'.strip() if wilayah_term else keyword
 
     while current < end_date:
         batch_end = min(current + DATE_DELTA, end_date)
         last_exc = None
-        for attempt in range(3):                        # up to 3 retries
+        for attempt in range(3):
             try:
                 hasil = gn.search(
                     q_base,
@@ -263,14 +361,66 @@ def cached_gnews_search(keyword: str,
                         all_entries.append({"title": title, "published": published,
                                             "link": link, "source": src})
                 last_exc = None
-                break                                   # success
+                break
             except Exception as exc:
                 last_exc = exc
-                time.sleep(2 ** attempt)               # 1s, 2s, 4s backoff
+                time.sleep(2 ** attempt)
         if last_exc:
             errors.append(f"{current}→{batch_end}: {type(last_exc).__name__}: {last_exc}")
         current = batch_end
-        time.sleep(0.5)                                # polite delay between batches
+        time.sleep(0.5)
+    return all_entries, errors
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def cached_newsapi_search(keyword: str,
+                          start_date: dt.date,
+                          end_date: dt.date,
+                          wilayah_term: str = "") -> List[Dict]:
+    """NewsAPI.org search"""
+    import urllib.parse
+
+    all_entries: List[Dict] = []
+    errors: List[str] = []
+
+    q = f'{keyword} {wilayah_term}'.strip() if wilayah_term else keyword
+    params = {
+        'q': q,
+        'language': 'id',
+        'from': start_date.strftime("%Y-%m-%d"),
+        'to': end_date.strftime("%Y-%m-%d"),
+        'sortBy': 'publishedAt',
+        'apiKey': NEWS_API_KEY,
+        'pageSize': 100,
+    }
+
+    url = f"https://newsapi.org/v2/everything?{urllib.parse.urlencode(params)}"
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+
+    try:
+        response = requests.get(url, headers=headers, timeout=15)
+        if response.status_code == 200:
+            data = response.json()
+            if data.get('status') == 'ok':
+                for article in data.get('articles', []):
+                    title = article.get('title', '-')
+                    link = article.get('url', '')
+                    source = article.get('source', {}).get('name', '-')
+                    published = article.get('publishedAt', '')
+                    if link:
+                        all_entries.append({
+                            "title": title,
+                            "published": published,
+                            "link": link,
+                            "source": source
+                        })
+            else:
+                errors.append(f"NewsAPI: {data.get('message', 'Unknown error')}")
+        else:
+            errors.append(f"NewsAPI HTTP {response.status_code}")
+        time.sleep(6)  # NewsAPI free tier: 10 req/min
+    except Exception as exc:
+        errors.append(f"NewsAPI: {type(exc).__name__}: {exc}")
 
     return all_entries, errors
 
@@ -305,47 +455,74 @@ def jalankan_scraper(
     max_ws: int = 3,
     max_wd: int = 5,
     max_wf: int = 3,
+    via_selected: str = "Semua",
 ):
-    tasks: List[Tuple[str, str]] = [
-        (kw, cat)
-        for cat in selected_cats
-        for kw in kata_kunci.get(cat, [])
-    ]
+    # Determine which sources to use
+    if via_selected == "Semua":
+        sources = ["google", "bing", "newsapi"]
+    elif via_selected == "Google News":
+        sources = ["google"]
+    elif via_selected == "Bing News":
+        sources = ["bing"]
+    elif via_selected == "NewsAPI.org":
+        sources = ["newsapi"]
+    else:
+        sources = ["bing"]
+
+    # NewsAPI warning for old dates
+    if "newsapi" in sources:
+        one_month_ago = dt.date.today() - dt.timedelta(days=30)
+        if start_date < one_month_ago:
+            st.warning("⚠️ NewsAPI.org tidak mengembalikan artikel lebih lama dari 1 bulan")
+
+    # Build tasks: (keyword, category, source)
+    tasks: List[Tuple[str, str, str]] = []
+    for cat in selected_cats:
+        for kw in kata_kunci.get(cat, []):
+            for src in sources:
+                tasks.append((kw, cat, src))
+
     if not tasks:
         st.warning("Tidak ada kata kunci yang dipilih.")
         return
 
     progress = st.progress(0.0)
     status   = st.empty()
-    status.info(f"🔄 Mempersiapkan pencarian... ({len(tasks)} keyword, {max_ws} worker paralel)")
+    status.info(f"🔄 Mempersiapkan {len(tasks)} pencarian ({len(sources)} sumber, {max_ws} worker)...")
 
-    # ── Step 1: Search Google News (paralel) ─────────────────────────────
+    # ── Step 1: Search (paralel) ─────────────────────────────
     done = 0
     by_link: Dict[str, Dict] = {}
-
     all_search_errors: List[str] = []
 
-    with ThreadPoolExecutor(max_workers=max_ws) as ex:
-        future_map = {
-            ex.submit(cached_gnews_search, kw, start_date, end_date, wilayah_term): (kw, cat)
-            for kw, cat in tasks
-        }
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        future_map = {}
+        for kw, cat, src in tasks:
+            if src == "google":
+                fut = ex.submit(cached_google_search, kw, start_date, end_date, wilayah_term)
+            elif src == "bing":
+                fut = ex.submit(cached_bing_search, kw, start_date, end_date, wilayah_term)
+            elif src == "newsapi":
+                fut = ex.submit(cached_newsapi_search, kw, start_date, end_date, wilayah_term)
+            future_map[fut] = (kw, cat, src)
+
         for fut in as_completed(future_map):
-            kw, cat = future_map[fut]
+            kw, cat, src = future_map[fut]
             try:
                 entries, errs = fut.result()
                 entries = entries or []
-                all_search_errors.extend([f"[{kw}] {e}" for e in errs])
+                all_search_errors.extend([f"[{kw}][{src}] {e}" for e in errs])
             except Exception as exc:
                 entries = []
-                all_search_errors.append(f"[{kw}] fut.result() failed: {exc}")
+                all_search_errors.append(f"[{kw}][{src}] Failed: {exc}")
 
             # Apply per-keyword limit AFTER cache lookup
             if per_kw_limit > 0:
                 entries = entries[:per_kw_limit]
 
+            # Dedup by normalized URL (strip query params)
             for e in entries:
-                link = e.get("link", "")
+                link = (e.get("link", "") or "").split("?")[0]
                 if not link:
                     continue
                 if link not in by_link:
@@ -354,14 +531,16 @@ def jalankan_scraper(
                         "published": e.get("published", ""),
                         "source":    e.get("source", "-"),
                         "cats":      set([cat]),
+                        "keywords":  set([kw]),  # Track keywords that found this article
                     }
                 else:
                     by_link[link]["cats"].add(cat)
+                    by_link[link]["keywords"].add(kw)  # Add keyword to existing entry
 
             done += 1
             progress.progress(done / max(1, len(tasks)))
-            status.write(f"🔎 Mencari: {done}/{len(tasks)} keyword selesai | "
-                         f"{len(by_link)} artikel unik ditemukan...")
+            status.write(f"🔎 Pencarian: {done}/{len(tasks)} selesai | "
+                         f"{len(by_link)} artikel unik")
 
     if not by_link:
         progress.empty(); status.empty()
@@ -371,7 +550,7 @@ def jalankan_scraper(
                     st.code(err)
         st.warning("Tidak ada artikel ditemukan.")
         st.session_state.scraped_data = pd.DataFrame(
-            columns=["Tanggal", "Judul", "Sumber", "Wilayah", "Kategori", "URL"])
+            columns=["Tanggal", "Judul", "Sumber", "Wilayah", "Kategori", "Keywords", "Hashtag", "URL"])
         return
 
     status.write(f"🔗 Total artikel unik: {len(by_link)}")
@@ -428,12 +607,21 @@ def jalankan_scraper(
         wilayah  = detect_wilayah(full_text, kab_items, prov_items)
         kategori = detect_kategori(full_text, kata_kunci, obj["cats"])
 
+        # Keywords: join all keywords that found this article
+        keywords_str = ", ".join(sorted(obj["keywords"]))
+
+        # Hashtags: extract from full text
+        hashtags = re.findall(r'#\w+', full_text)
+        hashtags_str = ", ".join(sorted(set(hashtags))) if hashtags else ""
+
         records.append({
             "Tanggal":  format_tanggal(obj["published"]),
             "Judul":    obj["title"],
             "Sumber":   obj["source"],
             "Wilayah":  wilayah,
             "Kategori": kategori,
+            "Keywords": keywords_str,
+            "Hashtag":  hashtags_str,
             "URL":      real_url,
         })
 
@@ -597,6 +785,16 @@ with col_opt:
     )
     per_kw_limit = _limit_map[_limit_label]
 
+    st.markdown("**Sumber Berita**")
+    _via_options = ["Semua", "Google News", "Bing News", "NewsAPI.org"]
+    _via_selected = st.selectbox(
+        "Sumber Berita",
+        _via_options,
+        index=0,
+        label_visibility="collapsed",
+        key="via_select"
+    )
+
 # ── Wilayah term untuk keyword pencarian ─────────────────────────────────
 if selected_prov_name == "Semua":
     wilayah_term = ""                          # tidak ada filter wilayah
@@ -610,7 +808,7 @@ total_kw = sum(len(kata_kunci.get(c, [])) for c in selected_cats)
 wilayah_info = f"**{wilayah_term}**" if wilayah_term else "Seluruh Indonesia"
 st.caption(
     f"📌 Kategori: **{selected_cat}** | {total_kw} kata kunci | "
-    f"Wilayah: {wilayah_info}"
+    f"Wilayah: {wilayah_info} | Sumber: **{_via_selected}**"
 )
 
 # ── Tombol scraping ───────────────────────────────────────────────────────
@@ -622,7 +820,7 @@ with col_btn:
 # ── Init session state ────────────────────────────────────────────────────
 if "scraped_data" not in st.session_state:
     st.session_state.scraped_data = pd.DataFrame(
-        columns=["Tanggal", "Judul", "Sumber", "Wilayah", "Kategori", "URL"])
+        columns=["Tanggal", "Judul", "Sumber", "Wilayah", "Kategori", "Keywords", "Hashtag", "URL"])
 
 # ── Jalankan scraper ──────────────────────────────────────────────────────
 if scrape_button:
@@ -643,6 +841,7 @@ if scrape_button:
             max_ws=3,
             max_wd=5,
             max_wf=3,
+            via_selected=_via_selected,
         )
 
 # ── Tampilkan hasil ───────────────────────────────────────────────────────
