@@ -6,4 +6,6 @@ trafilatura
 pandas
 openpyxl
 streamlit-aggrid
-
+beautifulsoup4
+requests
+duckduckgo-search
