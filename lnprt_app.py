@@ -176,22 +176,89 @@ def parse_relative_time_to_date(text: str) -> str:
 def clean_source_and_date(src: str, pub: str) -> Tuple[str, str]:
     if not src: src = "-"
     if not pub: pub = ""
-    
-    # Pisahkan angka di akhir string source. Misal: Tempo.co1h, TribunNews2thn
-    m = re.search(r'(\d+\s*(?:j|jam|h|hour|m|mnt|menit|hari|d|day|mgg|minggu|w|week|bln|bulan|mo|months?|thn|tahun|yr|years?)(?:\s+yang\s+lalu|\s+ago)?)$', src, flags=re.IGNORECASE)
-    if m:
-        time_str = m.group(1)
-        src = src[:m.start()].strip()
+
+    _TIME_PAT = (
+        r'\d+\s*'
+        r'(?:jam|hour|mnt|menit|hari|day|mgg|minggu|week|bln|bulan|months?|mo|tahun|thn|years?|yr'
+        r'|[jhdwm]\b)'  # Huruf tunggal HARUS di word boundary agar tidak cocok dengan 'juta', 'meter', dll
+        r'(?:\s+yang\s+lalu|\s+ago)?'
+    )
+
+    # 1. Strip waktu di AKHIR string: "Tempo.co1h", "TribunNews2thn"
+    m_end = re.search(rf'({_TIME_PAT})$', src, flags=re.IGNORECASE)
+    if m_end:
+        time_str = m_end.group(1)
+        src = src[:m_end.start()].strip()
         if not pub or pub == "-":
             pub = time_str
-            
-    # Hapus suffix "on MSN"
-    m_msn = re.search(r'\s+on\s+MSN$', src, flags=re.IGNORECASE)
+
+    # 2. Strip waktu di AWAL string: "9hon MSNOpinion" → "on MSNOpinion"
+    m_start = re.match(rf'^({_TIME_PAT})\s*', src, flags=re.IGNORECASE)
+    if m_start:
+        time_str = m_start.group(1)
+        src = src[m_start.end():].strip()
+        if not pub or pub == "-":
+            pub = time_str
+
+    # 3. Hapus "on MSN" + kata kategori opsional setelahnya: "on MSNOpinion", "on MSN"
+    m_msn = re.search(r'\s*on\s+MSN\w*', src, flags=re.IGNORECASE)
     if m_msn:
         src = src[:m_msn.start()].strip()
-            
+
+    # 4. Strip angka view/read count yang menempel: "Media Indonesia27 juta", "56 juta", "3471"
+    src = re.sub(r'\s*\d+(?:[.,]\d+)?\s*(?:juta|ribu|rb|k|m)?\s*$', '', src, flags=re.IGNORECASE).strip()
+
+    # 5. Tolak jika sumber hanya angka murni
+    if re.match(r'^\d+$', src.strip()):
+        src = "-"
+
+    # 6. Tolak sumber terlalu pendek (< 3 karakter) — kemungkinan artefak HTML seperti "Co"
+    if 0 < len(src) < 3:
+        src = "-"
+
     if not src: src = "-"
     return src, pub
+
+
+def source_from_url(url: str) -> str:
+    """Tebak nama sumber dari domain URL sebagai fallback."""
+    if not url:
+        return "-"
+    try:
+        from urllib.parse import urlparse
+        host = urlparse(url).hostname or ""
+        # Hapus www. dan subdomain umum
+        host = re.sub(r'^(www|m|mobile|amp)\.', '', host)
+        # Mapping domain terkenal ke nama yang lebih bersih
+        _DOMAIN_MAP = {
+            "kompas.com":      "Kompas",
+            "detik.com":       "Detik",
+            "tribunnews.com":  "Tribun News",
+            "cnnindonesia.com":"CNN Indonesia",
+            "tempo.co":        "Tempo",
+            "liputan6.com":    "Liputan6",
+            "okezone.com":     "Okezone",
+            "republika.co.id": "Republika",
+            "jpnn.com":        "JPNN",
+            "medcom.id":       "Medcom",
+            "beritasatu.com":  "BeritaSatu",
+            "antara.news":     "Antara News",
+            "antaranews.com":  "Antara News",
+            "sindonews.com":   "Sindo News",
+            "merdeka.com":     "Merdeka",
+            "suara.com":       "Suara",
+            "bisnis.com":      "Bisnis Indonesia",
+            "msn.com":         "MSN",
+        }
+        # Cek exact dan partial match
+        for domain, name in _DOMAIN_MAP.items():
+            if host.endswith(domain):
+                return name
+        # Fallback: ambil domain utama dan kapitalisasi
+        parts = host.rsplit(".", 2)
+        return parts[-2].capitalize() if len(parts) >= 2 else host
+    except Exception:
+        return "-"
 
 def format_tanggal(published: str) -> str:
     if not published or published == "-":
@@ -380,15 +447,31 @@ def cached_bing_search(keyword: str,
                             if not link or link in seen_urls:
                                 continue
 
-                            # Get source
+                            # Selalu baca teks elemen sumber Bing — untuk ekstrak tanggal relatif (misal: Detik5j)
                             src_elem = article.select_one('.source, .provider, cite')
-                            src = src_elem.text.strip() if src_elem else "-"
+                            src_raw = src_elem.text.strip() if src_elem else ""
 
-                            # Get published date
-                            date_elem = article.select_one('.date, .timestamp, time')
-                            published = date_elem.text.strip() if date_elem else ""
+                            # Sumber: utamakan dari URL jika domain ada di prelist
+                            src_from_url = source_from_url(link)
+                            if src_from_url != "-":
+                                src = src_from_url
+                            else:
+                                # Domain tidak dikenal — ambil dan bersihkan dari HTML Bing
+                                src, _ = clean_source_and_date(src_raw, "")
+                                if src == "-":
+                                    src = src_from_url
 
-                            src, published = clean_source_and_date(src, published)
+                            # Tanggal: cek atribut datetime dulu, lalu teks elemen date, lalu teks elemen sumber
+                            published = ""
+                            date_elem = article.select_one('time, .date, .timestamp')
+                            if date_elem:
+                                published = (date_elem.get('datetime', '') or
+                                             date_elem.get('data-content', '') or
+                                             date_elem.text.strip())
+
+                            # Fallback: waktu relatif dari teks elemen sumber (misal "Detik5j" → pub="5j")
+                            if not published and src_raw:
+                                _, published = clean_source_and_date(src_raw, "")
 
                             seen_urls.add(link)
                             all_entries.append({
@@ -476,9 +559,15 @@ def cached_google_search(keyword: str,
 
 @st.cache_data(ttl=24*3600, show_spinner=False)
 def decode_url_once(link: str) -> str:
-    try:
+    """Decode Google News link dengan batas waktu 10 detik."""
+    import concurrent.futures as _cf
+    def _do_decode():
         r = gnewsdecoder(link)
         return r["decoded_url"] if r.get("status") else link
+    try:
+        with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
+            fut = _ex.submit(_do_decode)
+            return fut.result(timeout=10)
     except Exception:
         return link
 
@@ -628,12 +717,12 @@ def jalankan_scraper(
         progress.progress(0.0)
         with ThreadPoolExecutor(max_workers=max_wd) as ex:
             future_map2 = {ex.submit(decode_url_once, ln): ln for ln in gnews_links}
-            for fut in as_completed(future_map2):
+            for fut in as_completed(future_map2, timeout=None):
                 ln = future_map2[fut]
                 try:
-                    decoded_map[ln] = fut.result()
+                    decoded_map[ln] = fut.result(timeout=12)  # Max 12 detik per URL
                 except Exception:
-                    decoded_map[ln] = ln
+                    decoded_map[ln] = ln  # Fallback ke link asli jika timeout/error
                 done += 1
                 progress.progress(done / max(1, len(gnews_links)))
                 status.write(f"🔓 Decode URL: {done}/{len(gnews_links)}...")
@@ -733,6 +822,15 @@ st.markdown("""
         border-radius: 8px; padding: 0.5em 1em;
     }
     div.stDownloadButton > button:hover { background-color: #1565C0; }
+
+    /* Sembunyikan toolbar Streamlit (hamburger, github, dll) di mobile */
+    @media (max-width: 768px) {
+        [data-testid="stToolbar"],
+        [data-testid="stToolbarActions"],
+        #MainMenu {
+            display: none !important;
+        }
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -742,9 +840,41 @@ if os.path.exists(LOGO_PATH):
     with open(LOGO_PATH, "rb") as f:
         encoded_logo = base64.b64encode(f.read()).decode()
 
-logo_html = f'<img src="data:image/png;base64,{encoded_logo}" style="height: 60px; position: absolute; left: 20px;">' if encoded_logo else ""
+logo_html = f'<img src="data:image/png;base64,{encoded_logo}" class="header-logo">' if encoded_logo else ""
 
 st.markdown(f"""
+<style>
+    .header-logo {{
+        height: 60px;
+        position: absolute;
+        left: 20px;
+    }}
+    .header-title-container {{
+        text-align: center;
+        padding: 0 10px;
+    }}
+    .header-title {{
+        font-size: 30px;
+        font-weight: bold;
+        line-height: 1.1;
+    }}
+    .header-subtitle {{
+        font-size: 14px;
+        color: gray;
+    }}
+    
+    @media (max-width: 768px) {{
+        .header-logo {{
+            display: none !important;
+        }}
+        .header-title {{
+            font-size: 22px !important;
+        }}
+        .header-subtitle {{
+            font-size: 11px !important;
+        }}
+    }}
+</style>
 <div style="
     position: fixed;
     top: 0;
@@ -761,9 +891,9 @@ st.markdown(f"""
     box-shadow: 0 2px 4px rgba(0,0,0,0.05);
 ">
     {logo_html}
-    <div style="text-align: center;">
-        <div style="font-size: 30px; font-weight: bold; line-height: 1.1;">BERITA LNPRT</div>
-        <div style="font-size: 14px; color: gray;">Scraper Berita Lembaga Non-Profit yang Melayani Rumah Tangga</div>
+    <div class="header-title-container">
+        <div class="header-title">BERITA LNPRT</div>
+        <div class="header-subtitle">Scraper Berita Lembaga Non-Profit yang Melayani Rumah Tangga</div>
     </div>
 </div>
 """, unsafe_allow_html=True)
