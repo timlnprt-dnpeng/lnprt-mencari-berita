@@ -38,7 +38,7 @@ MAX_WORKERS = 5  # Worker paralel (Streamlit Cloud: 2 vCPUs)
 try:
     NEWS_API_KEY = st.secrets["NEWS_API_KEY"]
 except Exception:
-    NEWS_API_KEY = "4cf8032e0a0d4107a68443615aefd46a"
+    NEWS_API_KEY = ""
 
 # ============================================================
 # 1. LOAD DATA REFERENSI
