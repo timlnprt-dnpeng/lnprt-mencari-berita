@@ -49,7 +49,10 @@ except Exception:
 def load_kata_kunci() -> Dict[str, List[str]]:
     """Baris 0 = nama kategori, baris 1+ = keyword."""
     if not os.path.exists(KATA_KUNCI_PATH): return {}
-    df = pd.read_excel(KATA_KUNCI_PATH, header=None)
+    try:
+        df = pd.read_excel(KATA_KUNCI_PATH, sheet_name='keyword', header=None)
+    except Exception:
+        df = pd.read_excel(KATA_KUNCI_PATH, header=None)
     result: Dict[str, List[str]] = {}
     for col in range(df.shape[1]):
         cat = str(df.iloc[0, col]).strip()
@@ -71,6 +74,29 @@ def load_kategori_dict() -> Dict[str, List[str]]:
             result[cat] = kws
     return result
 
+
+@st.cache_data(show_spinner=False)
+def load_persepsi() -> Tuple[List[str], List[str]]:
+    """Membaca keyword persepsi dari sheet 'persepsi'."""
+    if not os.path.exists(KATA_KUNCI_PATH): return [], []
+    try:
+        try:
+            df = pd.read_excel(KATA_KUNCI_PATH, sheet_name='persepsi', header=None)
+        except Exception:
+            df = pd.read_excel(KATA_KUNCI_PATH, sheet_name='persepi', header=None)
+    except Exception:
+        return [], []
+        
+    pos_kws = []
+    neg_kws = []
+    for col in range(df.shape[1]):
+        header = str(df.iloc[0, col]).strip()
+        kws = [str(v).strip() for v in df.iloc[1:, col] if pd.notna(v) and str(v).strip()]
+        if header in ['1', '1.0']:
+            pos_kws.extend(kws)
+        elif header in ['-1', '-1.0']:
+            neg_kws.extend(kws)
+    return pos_kws, neg_kws
 
 @st.cache_data(show_spinner=False)
 def load_wilayah():
@@ -249,13 +275,22 @@ def source_from_url(url: str) -> str:
             "suara.com":       "Suara",
             "bisnis.com":      "Bisnis Indonesia",
             "msn.com":         "MSN",
+            "viva.co.id":      "VIVA",
+            "cnbcindonesia.com": "CNBC Indonesia",
+            "inews.id":        "iNews",
+            "tvonenews.com":   "tvOneNews",
+            "kumparan.com":    "Kumparan",
+            "pikiran-rakyat.com": "Pikiran Rakyat",
+            "jawapos.com":     "Jawa Pos"
         }
         # Cek exact dan partial match
         for domain, name in _DOMAIN_MAP.items():
             if host.endswith(domain):
                 return name
         # Fallback: ambil domain utama dan kapitalisasi
-        parts = host.rsplit(".", 2)
+        parts = host.rsplit(".")
+        if len(parts) >= 3 and parts[-2].lower() in ["co", "or", "go", "ac", "sch", "my", "biz", "web", "desa"]:
+            return parts[-3].capitalize()
         return parts[-2].capitalize() if len(parts) >= 2 else host
     except Exception:
         return "-"
@@ -268,11 +303,37 @@ def format_tanggal(published: str) -> str:
     if re.match(r'\d{2}/\d{2}/\d{4}', rel_date):
         return rel_date
         
-    for fmt in ("%a, %d %b %Y %H:%M:%S %Z", "%a, %d %b %Y %H:%M:%S %z", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d"):
+    for fmt in ("%a, %d %b %Y %H:%M:%S %Z", "%a, %d %b %Y %H:%M:%S %z", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%d"):
         try:
             return datetime.strptime(published.strip(), fmt).strftime("%d/%m/%Y")
         except Exception:
             pass
+            
+    # Fallback to isoformat
+    try:
+        return datetime.fromisoformat(published.strip()).strftime("%d/%m/%Y")
+    except Exception:
+        pass
+        
+    # Terjemahkan bulan Indonesia dan gunakan dateutil.parser untuk parse teks bebas
+    try:
+        from dateutil import parser
+        bulan = {
+            'januari': 'Jan', 'februari': 'Feb', 'maret': 'Mar', 'april': 'Apr',
+            'mei': 'May', 'juni': 'Jun', 'juli': 'Jul', 'agustus': 'Aug',
+            'september': 'Sep', 'oktober': 'Oct', 'november': 'Nov', 'desember': 'Dec',
+            'jan': 'Jan', 'feb': 'Feb', 'mar': 'Mar', 'apr': 'Apr',
+            'agu': 'Aug', 'sep': 'Sep', 'okt': 'Oct', 'nov': 'Nov', 'des': 'Dec'
+        }
+        date_lower = published.strip().lower()
+        for id_month, en_month in bulan.items():
+            date_lower = re.sub(r'\b' + id_month + r'\b', en_month.lower(), date_lower)
+            
+        parsed_date = parser.parse(date_lower, fuzzy=True)
+        return parsed_date.strftime("%d/%m/%Y")
+    except Exception:
+        pass
+        
     return published
 
 
@@ -301,6 +362,31 @@ def detect_wilayah(text: str, kab_items, prov_items) -> str:
     return ", ".join(all_codes)
 
 
+def detect_persepsi(title: str, text: str, pos_kws: List[str], neg_kws: List[str], check_text: bool) -> int:
+    def count_kws(content: str, kws: List[str]) -> int:
+        if not content: return 0
+        count = 0
+        content_up = content.upper()
+        for kw in kws:
+            pattern = r"(?<![A-Z])" + re.escape(kw.upper()) + r"(?![A-Z])"
+            count += len(re.findall(pattern, content_up))
+        return count
+
+    pos_count = count_kws(title, pos_kws)
+    neg_count = count_kws(title, neg_kws)
+    
+    if pos_count == 0 and neg_count == 0 and check_text and text:
+        pos_count = count_kws(text, pos_kws)
+        neg_count = count_kws(text, neg_kws)
+        
+    if pos_count > neg_count:
+        return 1
+    elif neg_count > pos_count:
+        return -1
+    else:
+        return 0
+
+
 def detect_kategori(text: str, kategori_dict: Dict[str, List[str]],
                     initial_cats: Set[str]) -> str:
     text_up = text.upper()
@@ -323,19 +409,91 @@ def detect_kategori(text: str, kategori_dict: Dict[str, List[str]],
     return ""
 
 
-def fetch_article_text(url: str) -> str:
+def fetch_article_data(url: str) -> Dict[str, str]:
+    result = {"text": "", "date": ""}
     try:
+        import requests
+        from bs4 import BeautifulSoup
+        import json
         import trafilatura
-        html = trafilatura.fetch_url(url)
-        if html:
-            return trafilatura.extract(html) or ""
+        
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        }
+        # Tambahkan timeout agar tidak hang
+        response = requests.get(url, headers=headers, timeout=10)
+        if response.status_code == 200:
+            html = response.text
+            
+            # 1. Ekstrak teks menggunakan trafilatura
+            result["text"] = trafilatura.extract(html) or ""
+            
+            # 2. Ekstrak tanggal sebagai fallback menggunakan BeautifulSoup
+            soup = BeautifulSoup(html, 'html.parser')
+            
+            # Coba JSON-LD dulu
+            for script in soup.find_all('script', {'type': 'application/ld+json'}):
+                try:
+                    data = json.loads(script.string)
+                    if isinstance(data, dict):
+                        date_pub = data.get('datePublished')
+                        if date_pub:
+                            result["date"] = date_pub
+                            break
+                    elif isinstance(data, list):
+                        for item in data:
+                            if isinstance(item, dict) and item.get('datePublished'):
+                                result["date"] = item.get('datePublished')
+                                break
+                except Exception:
+                    pass
+                if result["date"]: break
+            
+            # Coba meta tag jika JSON-LD gagal
+            if not result["date"]:
+                meta_tags = [
+                    ('meta', {'property': 'article:published_time'}, 'content'),
+                    ('meta', {'name': 'pubdate'}, 'content'),
+                    ('time', {}, 'datetime')
+                ]
+                for tag, attrs, prop in meta_tags:
+                    for el in soup.find_all(tag, attrs):
+                        val = el.get(prop)
+                        if val:
+                            result["date"] = val
+                            break
+                    if result["date"]: break
     except Exception:
         pass
-    return ""
+    return result
 
 # ============================================================
 # 3. EXPORT & DISPLAY
 # ============================================================
+
+_persepsi_renderer = JsCode("""
+class PersepsiRenderer {
+    init(params) {
+        this.eGui = document.createElement('span');
+        let val = params.value;
+        if (val == 1 || val == '1') {
+            this.eGui.innerHTML = '▲';
+            this.eGui.style.color = '#4CAF50';
+        } else if (val == -1 || val == '-1') {
+            this.eGui.innerHTML = '▼';
+            this.eGui.style.color = '#F44336';
+        } else {
+            this.eGui.innerHTML = '=';
+            this.eGui.style.color = '#9E9E9E';
+        }
+        this.eGui.style.fontWeight = 'bold';
+        this.eGui.style.fontSize = '16px';
+        this.eGui.style.textAlign = 'center';
+        this.eGui.style.display = 'block';
+    }
+    getGui() { return this.eGui; }
+}
+""")
 
 _link_btn = JsCode("""
 class LinkRenderer {
@@ -370,6 +528,7 @@ def show_aggrid(df: pd.DataFrame):
     gb.configure_side_bar()
     gb.configure_default_column(editable=False, groupable=True, resizable=True)
     gb.configure_grid_options(enableRangeSelection=True, enableCellTextSelection=True)
+    gb.configure_column("Persepsi", cellRenderer=_persepsi_renderer, width=90, type=["numericColumn"])
     gb.configure_column("Buka", cellRenderer=_link_btn, width=90,
                         pinned="left", suppressSizeToFit=True)
     gridOptions = gb.build()
@@ -550,7 +709,9 @@ def cached_google_search(keyword: str,
         if last_exc:
             errors.append(f"{current}→{batch_end}: {type(last_exc).__name__}: {last_exc}")
         current = batch_end
-        time.sleep(0.5)
+        time.sleep(DELAY_REQ)
+        
+    time.sleep(DELAY_REQ)
     return all_entries, errors
 
 
@@ -573,8 +734,8 @@ def decode_url_once(link: str) -> str:
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def cached_fetch_text(url: str) -> str:
-    return fetch_article_text(url)
+def cached_fetch_article_data(url: str) -> Dict[str, str]:
+    return fetch_article_data(url)
 
 # ============================================================
 # 5. MAIN SCRAPER FUNCTION
@@ -585,6 +746,8 @@ def jalankan_scraper(
     kategori_dict: Dict[str, List[str]],
     custom_kw_list: List[str],
     kab_items, prov_items,
+    pos_kws: List[str],
+    neg_kws: List[str],
     selected_cats: List[str],
     start_date: dt.date,
     end_date: dt.date,
@@ -703,7 +866,7 @@ def jalankan_scraper(
                     st.code(err)
         st.warning("Tidak ada artikel ditemukan.")
         st.session_state.scraped_data = pd.DataFrame(
-            columns=["Tanggal", "Judul", "Sumber", "Wilayah", "Kategori", "Keywords", "Hashtag", "URL"])
+            columns=["Tanggal", "Judul", "Sumber", "Wilayah", "Kategori", "Persepsi", "Keywords", "Hashtag", "URL"])
         return
 
     status.write(f"🔗 Total artikel unik: {len(by_link)}")
@@ -730,35 +893,42 @@ def jalankan_scraper(
         decoded_map = {ln: ln for ln in gnews_links}
 
     # ── Step 3: Fetch teks artikel (paralel, opsional) ────────────────────
-    text_map: Dict[str, str] = {}
+    data_map: Dict[str, Dict[str, str]] = {}
     real_urls = [decoded_map[ln] for ln in gnews_links]
 
     if fetch_artikel:
         done = 0
         progress.progress(0.0)
         with ThreadPoolExecutor(max_workers=max_wf) as ex:
-            future_map3 = {ex.submit(cached_fetch_text, url): url for url in real_urls}
+            future_map3 = {ex.submit(cached_fetch_article_data, url): url for url in real_urls}
             for fut in as_completed(future_map3):
                 url = future_map3[fut]
                 try:
-                    text_map[url] = fut.result()
+                    data_map[url] = fut.result()
                 except Exception:
-                    text_map[url] = ""
+                    data_map[url] = {"text": "", "date": ""}
                 done += 1
                 progress.progress(done / max(1, len(real_urls)))
-                status.write(f"📄 Fetch teks artikel: {done}/{len(real_urls)}...")
+                status.write(f"📄 Fetch data artikel: {done}/{len(real_urls)}...")
     else:
-        text_map = {url: "" for url in real_urls}
+        data_map = {url: {"text": "", "date": ""} for url in real_urls}
 
     # ── Step 4: Build records ─────────────────────────────────────────────
     records = []
     for gnews_link, obj in by_link.items():
         real_url = decoded_map.get(gnews_link, gnews_link)
-        art_text = text_map.get(real_url, "")
+        art_data = data_map.get(real_url, {"text": "", "date": ""})
+        art_text = art_data["text"]
         full_text = obj["title"] + " " + art_text
 
         wilayah  = detect_wilayah(full_text, kab_items, prov_items)
         kategori = detect_kategori(full_text, kategori_dict, obj["cats"])
+        persepsi = detect_persepsi(obj["title"], art_text, pos_kws, neg_kws, fetch_artikel)
+
+        # Fallback date dari scrape artikel jika kosong atau "-"
+        published = obj["published"]
+        if (not published or published == "-") and art_data.get("date"):
+            published = format_tanggal(art_data["date"])
 
         # Keywords: join all keywords that found this article
         keywords_str = ", ".join(sorted(obj["keywords"]))
@@ -768,11 +938,12 @@ def jalankan_scraper(
         hashtags_str = ", ".join(sorted(set(hashtags))) if hashtags else ""
 
         records.append({
-            "Tanggal":  obj["published"],
+            "Tanggal":  published,
             "Judul":    obj["title"],
             "Sumber":   obj["source"],
             "Wilayah":  wilayah,
             "Kategori": kategori,
+            "Persepsi": persepsi,
             "Keywords": keywords_str,
             "Hashtag":  hashtags_str,
             "URL":      real_url,
@@ -902,6 +1073,7 @@ st.markdown(f"""
 with st.spinner("Memuat data referensi..."):
     kata_kunci = load_kata_kunci()
     kategori_dict = load_kategori_dict()
+    pos_kws, neg_kws = load_persepsi()
     kab_items, prov_items, sorted_provs, kab_by_prov = load_wilayah()
 
 semua_kategori = list(kata_kunci.keys())
@@ -1040,7 +1212,7 @@ with col_btn:
 # ── Init session state ────────────────────────────────────────────────────
 if "scraped_data" not in st.session_state:
     st.session_state.scraped_data = pd.DataFrame(
-        columns=["Tanggal", "Judul", "Sumber", "Wilayah", "Kategori", "Keywords", "Hashtag", "URL"])
+        columns=["Tanggal", "Judul", "Sumber", "Wilayah", "Kategori", "Persepsi", "Keywords", "Hashtag", "URL"])
 
 # ── Jalankan scraper ──────────────────────────────────────────────────────
 if scrape_button:
@@ -1053,6 +1225,8 @@ if scrape_button:
             custom_kw_list=custom_kw_list,
             kab_items=kab_items,
             prov_items=prov_items,
+            pos_kws=pos_kws,
+            neg_kws=neg_kws,
             selected_cats=selected_cats,
             start_date=start_date,
             end_date=end_date,
