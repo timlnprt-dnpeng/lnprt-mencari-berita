@@ -16,7 +16,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
 import threading
 import requests
-from pygooglenews import GoogleNews
+import feedparser
+import urllib.parse
 from googlenewsdecoder import gnewsdecoder
 from st_aggrid import AgGrid, GridOptionsBuilder, JsCode
 
@@ -30,8 +31,6 @@ KATEGORI_PATH   = os.path.join(_HERE, "Kategori.xlsx")
 WILAYAH_PATH    = os.path.join(_HERE, "Daftar Wilayah.xlsx")
 LOGO_PATH       = os.path.join(_HERE, "Logo.png")
 
-gn         = GoogleNews(lang="id", country="ID")
-DATE_DELTA = dt.timedelta(days=30)
 UMUM       = "Umum"
 DELAY_REQ  = 3  # Detik delay antar request untuk hindari blokir
 MAX_WORKERS = 5  # Worker paralel (Streamlit Cloud: 2 vCPUs)
@@ -660,57 +659,111 @@ def cached_bing_search(keyword: str,
     return all_entries, errors
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def cached_google_search(keyword: str,
-                          start_date: dt.date,
-                          end_date: dt.date,
-                          wilayah_term: str = "") -> List[Dict]:
-    """Google News search menggunakan pygooglenews"""
-    all_entries: List[Dict] = []
-    errors: List[str] = []
-    current = start_date
-    q_base = f'{keyword} {wilayah_term}'.strip() if wilayah_term else keyword
+def _strip_title_source_suffix(title: str, source_name: str) -> str:
+    """
+    RSS Google News selalu memformat title sebagai 'Judul Artikel - Nama Media'.
+    Karena nama media sudah ada terpisah di kolom source, suffix ini dibuang
+    dari judul agar tidak dobel/redundan.
+    """
+    if not title or not source_name or source_name == "-":
+        return title
+    suffix = f" - {source_name}"
+    if title.lower().endswith(suffix.lower()):
+        return title[: -len(suffix)].strip()
+    return title
 
-    while current < end_date:
-        batch_end = min(current + DATE_DELTA, end_date)
-        last_exc = None
-        for attempt in range(3):
-            try:
-                hasil = gn.search(
-                    q_base,
-                    from_=current.strftime("%Y-%m-%d"),
-                    to_=batch_end.strftime("%Y-%m-%d")
-                )
-                for e in hasil.get("entries", []):
-                    title     = getattr(e, "title",     None) or e.get("title",     "-") or "-"
-                    published = getattr(e, "published", None) or e.get("published", "") or ""
-                    link      = getattr(e, "link",      None) or e.get("link",      "") or ""
+
+_GNEWS_RSS_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                  '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Accept-Language': 'id-ID,id;q=0.9,en;q=0.8',
+}
+
+def _fetch_gnews_rss_day(q_base: str, day: dt.date) -> Tuple[List[Dict], Optional[str]]:
+    """Ambil 1 hari RSS Google News untuk 1 query. Return (entries, error_message)."""
+    next_day = day + dt.timedelta(days=1)
+    query = f'{q_base} after:{day.strftime("%Y-%m-%d")} before:{next_day.strftime("%Y-%m-%d")}'
+    url = ("https://news.google.com/rss/search?"
+           f"q={urllib.parse.quote(query)}&hl=id&gl=ID&ceid=ID:id")
+
+    entries: List[Dict] = []
+    last_exc = None
+    for attempt in range(3):
+        try:
+            resp = requests.get(url, headers=_GNEWS_RSS_HEADERS, timeout=15)
+            if resp.status_code == 200:
+                feed = feedparser.parse(resp.content)
+                for e in feed.entries:
+                    title     = getattr(e, "title", "-") or "-"
+                    published = getattr(e, "published", "") or ""
+                    link      = getattr(e, "link", "") or ""
+
                     src = "-"
                     try:
                         src = e.source.title
                     except Exception:
                         try:
-                            s = e.get("source", None)
+                            s = getattr(e, "source", None)
                             if isinstance(s, dict):
                                 src = s.get("title", "-") or "-"
                         except Exception:
                             pass
-                            
+
+                    # Bersihkan suffix " - Nama Media" dari judul SEBELUM src
+                    # dimodifikasi oleh clean_source_and_date (agar suffix
+                    # yang dicocokkan persis sama dengan yang ditulis Google).
+                    title = _strip_title_source_suffix(title, src)
+
                     src, published = clean_source_and_date(src, published)
-                    
+
                     if link:
-                        all_entries.append({"title": title, "published": published,
-                                            "link": link, "source": src})
-                last_exc = None
-                break
+                        entries.append({"title": title, "published": published,
+                                        "link": link, "source": src})
+                return entries, None
+            else:
+                last_exc = Exception(f"HTTP {resp.status_code}")
+        except Exception as exc:
+            last_exc = exc
+        time.sleep(2 ** attempt)
+
+    return entries, f"{day}: {type(last_exc).__name__}: {last_exc}" if last_exc else None
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def cached_google_search(keyword: str,
+                          start_date: dt.date,
+                          end_date: dt.date,
+                          wilayah_term: str = "") -> Tuple[List[Dict], List[str]]:
+    """
+    Google News search menggunakan RSS (news.google.com/rss/search).
+    Karena RSS Google News hanya menampilkan maksimal ±100 artikel per request,
+    rentang tanggal dipecah menjadi 1 request RSS per hari per keyword.
+    """
+    all_entries: List[Dict] = []
+    errors: List[str] = []
+    q_base = f'{keyword} {wilayah_term}'.strip() if wilayah_term else keyword
+
+    days: List[dt.date] = []
+    current = start_date
+    while current <= end_date:
+        days.append(current)
+        current += dt.timedelta(days=1)
+
+    # Request harian dijalankan paralel ringan (per keyword) agar tidak terlalu lambat,
+    # namun tetap diberi jeda kecil untuk menghindari blokir.
+    with ThreadPoolExecutor(max_workers=min(5, max(1, len(days)))) as ex:
+        future_map = {ex.submit(_fetch_gnews_rss_day, q_base, d): d for d in days}
+        for fut in as_completed(future_map):
+            try:
+                entries, err = fut.result()
+                all_entries.extend(entries)
+                if err:
+                    errors.append(err)
             except Exception as exc:
-                last_exc = exc
-                time.sleep(2 ** attempt)
-        if last_exc:
-            errors.append(f"{current}→{batch_end}: {type(last_exc).__name__}: {last_exc}")
-        current = batch_end
-        time.sleep(DELAY_REQ)
-        
+                d = future_map[fut]
+                errors.append(f"{d}: {type(exc).__name__}: {exc}")
+            time.sleep(DELAY_REQ / 5)  # jeda kecil antar hasil agar tidak terlalu agresif
+
     time.sleep(DELAY_REQ)
     return all_entries, errors
 
