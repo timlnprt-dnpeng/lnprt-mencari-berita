@@ -15,6 +15,7 @@ from typing import List, Dict, Set, Tuple, Any, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
 import threading
+import random
 import requests
 import feedparser
 import urllib.parse
@@ -675,13 +676,17 @@ def _strip_title_source_suffix(title: str, source_name: str) -> str:
     return title
 
 
-_GNEWS_RSS_HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
-                  '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Accept-Language': 'id-ID,id;q=0.9,en;q=0.8',
-}
+# Daftar User-Agent berbeda untuk rotasi agar tidak terdeteksi sebagai bot
+_GNEWS_UA_LIST = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:127.0) Gecko/20100101 Firefox/127.0',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 Edg/125.0.0.0',
+]
 
-def _fetch_gnews_rss_day(q_base: str, day: dt.date) -> Tuple[List[Dict], Optional[str]]:
+_GNEWS_RSS_TIMEOUT = 30  # timeout lebih panjang untuk menghindari false positive timeout
+
+def _fetch_gnews_rss_day(q_base: str, day: dt.date, _retry_count: int = 5) -> Tuple[List[Dict], Optional[str]]:
     """Ambil 1 hari RSS Google News untuk 1 query. Return (entries, error_message)."""
     next_day = day + dt.timedelta(days=1)
     query = f'{q_base} after:{day.strftime("%Y-%m-%d")} before:{next_day.strftime("%Y-%m-%d")}'
@@ -690,9 +695,21 @@ def _fetch_gnews_rss_day(q_base: str, day: dt.date) -> Tuple[List[Dict], Optiona
 
     entries: List[Dict] = []
     last_exc = None
-    for attempt in range(3):
+    for attempt in range(_retry_count):
+        # Rotasi User-Agent dan tambah header browser-like lengkap
+        headers = {
+            'User-Agent': _GNEWS_UA_LIST[attempt % len(_GNEWS_UA_LIST)],
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+            'Accept-Language': 'id-ID,id;q=0.9,en-US,en;q=0.8',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Cache-Control': 'no-cache',
+            'Pragma': 'no-cache',
+            'DNT': '1',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+        }
         try:
-            resp = requests.get(url, headers=_GNEWS_RSS_HEADERS, timeout=15)
+            resp = requests.get(url, headers=headers, timeout=_GNEWS_RSS_TIMEOUT)
             if resp.status_code == 200:
                 feed = feedparser.parse(resp.content)
                 for e in feed.entries:
@@ -724,9 +741,20 @@ def _fetch_gnews_rss_day(q_base: str, day: dt.date) -> Tuple[List[Dict], Optiona
                 return entries, None
             else:
                 last_exc = Exception(f"HTTP {resp.status_code}")
+                # Kalau kena 429/503 (rate limit Google), coba 1x lagi dgn delay panjang,
+                # lalu fail. Block biasanya berlangsung menit-jam, retry berkali-kali
+                # hanya buang waktu.
+                if resp.status_code in (429, 503):
+                    if attempt < 1:  # coba 1x retry
+                        delay = 15 + random.uniform(3, 7)
+                        time.sleep(delay)
+                        continue
+                    else:
+                        return entries, f"{day}: HTTP {resp.status_code} (rate limited by Google)"
         except Exception as exc:
             last_exc = exc
-        time.sleep(2 ** attempt)
+        delay = (2 ** attempt) + random.uniform(0.5, 2)
+        time.sleep(delay)
 
     return entries, f"{day}: {type(last_exc).__name__}: {last_exc}" if last_exc else None
 
@@ -751,26 +779,19 @@ def cached_google_search(keyword: str,
         days.append(current)
         current += dt.timedelta(days=1)
 
-    # Request harian dijalankan paralel ringan (per keyword) agar tidak terlalu lambat,
-    # namun tetap diberi jeda kecil untuk menghindari blokir.
-    with ThreadPoolExecutor(max_workers=min(5, max(1, len(days)))) as ex:
-        future_map = {ex.submit(_fetch_gnews_rss_day, q_base, d): d for d in days}
-        for fut in as_completed(future_map):
-            try:
-                entries, err = fut.result()
-                all_entries.extend(entries)
-                if err:
-                    errors.append(err)
-            except Exception as exc:
-                d = future_map[fut]
-                errors.append(f"{d}: {type(exc).__name__}: {exc}")
-            time.sleep(DELAY_REQ / 5)  # jeda kecil antar hasil agar tidak terlalu agresif
+    # Request HARIAN DIJALANKAN SEQUENTIAL (1 per 1) agar tidak memicu rate limit Google.
+    # Google RSS sangat sensitif terhadap parallel request — sekali kena 503,
+    # semua request selanjutnya dalam beberapa menit akan ditolak.
+    for d in days:
+        entries, err = _fetch_gnews_rss_day(q_base, d)
+        all_entries.extend(entries)
+        if err:
+            errors.append(err)
+        # Jeda dengan random jitter agar pola tidak terdeteksi sebagai bot
+        time.sleep(DELAY_REQ + random.uniform(0.5, 2.5))
 
-    time.sleep(DELAY_REQ)
     return all_entries, errors
 
-
-# (Fungsi DDG Dihapus)
 
 
 @st.cache_data(ttl=24*3600, show_spinner=False)
@@ -791,6 +812,16 @@ def decode_url_once(link: str) -> str:
 @st.cache_data(ttl=3600, show_spinner=False)
 def cached_fetch_article_data(url: str) -> Dict[str, str]:
     return fetch_article_data(url)
+
+
+def _call_google_search_locked(
+    keyword: str, start_date: dt.date, end_date: dt.date,
+    wilayah_term: str, lock: threading.Lock
+) -> Tuple[List[Dict], List[str]]:
+    """Wrapper untuk memastikan hanya 1 request Google RSS dalam satu waktu."""
+    with lock:
+        return cached_google_search(keyword, start_date, end_date, wilayah_term)
+
 
 # ============================================================
 # 5. MAIN SCRAPER FUNCTION
@@ -848,7 +879,10 @@ def jalankan_scraper(
 
     exclusion_list = load_exclusion_list()
 
-    # ── Step 1: Search (paralel) ─────────────────────────────
+    # ── Step 1: Search — Google sequential, Bing paralel ──────
+    # Google RSS sangat sensitif terhadap parallel request. Gunakan semaphore
+    # agar hanya 1 request Google dalam satu waktu, di seluruh keyword.
+    _google_lock = threading.Lock()
     done = 0
     by_link: Dict[str, Dict] = {}
     all_search_errors: List[str] = []
@@ -857,7 +891,7 @@ def jalankan_scraper(
         future_map = {}
         for kw, cat, src in tasks:
             if src == "google":
-                fut = ex.submit(cached_google_search, kw, start_date, end_date, wilayah_term)
+                fut = ex.submit(_call_google_search_locked, kw, start_date, end_date, wilayah_term, _google_lock)
             elif src == "bing":
                 fut = ex.submit(cached_bing_search, kw, start_date, end_date, wilayah_term)
             future_map[fut] = (kw, cat, src)
@@ -915,6 +949,10 @@ def jalankan_scraper(
 
     if not by_link:
         progress.empty(); status.empty()
+        has_google_503 = any("HTTP 503" in e or "HTTP 429" in e for e in all_search_errors)
+        if has_google_503:
+            st.error("⚠️ **Google News sedang memblokir permintaan otomatis** (HTTP 503). "
+                     "Coba gunakan sumber **Bing News** atau tunggu beberapa saat.")
         if all_search_errors:
             with st.expander("⚠️ Error detail (klik untuk lihat)"):
                 for err in all_search_errors[:20]:
