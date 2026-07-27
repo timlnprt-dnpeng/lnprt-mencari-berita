@@ -172,27 +172,29 @@ def parse_relative_time_to_date(text: str) -> str:
     now = datetime.now()
     text_lower = text.lower()
     
-    m_min = re.search(r'(\d+)\s*(?:m|mnt|menit)', text_lower)
+    # Gunakan \b (word boundary) setelah setiap pola satuan waktu
+    # agar "j" tidak cocok dengan "Jul", "m" tidak cocok dengan "Mar", dll.
+    m_min = re.search(r'(\d+)\s*(?:m\b|mnt\b|menit\b)', text_lower)
     if m_min and 'minggu' not in text_lower:
         return (now - dt.timedelta(minutes=int(m_min.group(1)))).strftime("%d/%m/%Y")
         
-    m_hour = re.search(r'(\d+)\s*(?:j|jam|h|hour)', text_lower)
+    m_hour = re.search(r'(\d+)\s*(?:j\b|jam\b|h\b|hour\b)', text_lower)
     if m_hour and 'hari' not in text_lower:
         return (now - dt.timedelta(hours=int(m_hour.group(1)))).strftime("%d/%m/%Y")
         
-    m_day = re.search(r'(\d+)\s*(?:hari|d|day)', text_lower)
+    m_day = re.search(r'(\d+)\s*(?:hari\b|d\b|day\b)', text_lower)
     if m_day:
         return (now - dt.timedelta(days=int(m_day.group(1)))).strftime("%d/%m/%Y")
         
-    m_week = re.search(r'(\d+)\s*(?:mgg|minggu|w|week)', text_lower)
+    m_week = re.search(r'(\d+)\s*(?:mgg\b|minggu\b|w\b|week\b)', text_lower)
     if m_week:
         return (now - dt.timedelta(weeks=int(m_week.group(1)))).strftime("%d/%m/%Y")
         
-    m_month = re.search(r'(\d+)\s*(?:bln|bulan|mo|month)s?', text_lower)
+    m_month = re.search(r'(\d+)\s*(?:bln\b|bulan\b|mo\b|month\b)\s?', text_lower)
     if m_month:
         return (now - dt.timedelta(days=int(m_month.group(1))*30)).strftime("%d/%m/%Y")
         
-    m_year = re.search(r'(\d+)\s*(?:thn|tahun|yr|year)s?', text_lower)
+    m_year = re.search(r'(\d+)\s*(?:thn\b|tahun\b|yr\b|year\b)\s?', text_lower)
     if m_year:
         return (now - dt.timedelta(days=int(m_year.group(1))*365)).strftime("%d/%m/%Y")
         
