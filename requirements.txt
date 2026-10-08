@@ -8,3 +8,4 @@ beautifulsoup4
 requests
 python-dateutil
 feedparser
+selectolax<1.0.0
