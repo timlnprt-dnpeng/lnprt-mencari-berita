@@ -32,9 +32,9 @@ KATEGORI_PATH   = os.path.join(_HERE, "Kategori.xlsx")
 WILAYAH_PATH    = os.path.join(_HERE, "Daftar Wilayah.xlsx")
 LOGO_PATH       = os.path.join(_HERE, "Logo.png")
 
-UMUM       = "Umum"
-DELAY_REQ  = 3  # Detik delay antar request untuk hindari blokir
-MAX_WORKERS = 5  # Worker paralel (Streamlit Cloud: 2 vCPUs)
+UMUM        = "Umum"
+DELAY_REQ   = 3  # Detik delay antar request untuk hindari blokir
+MAX_WORKERS = 5  # Worker paralel
 
 try:
     NEWS_API_KEY = st.secrets["NEWS_API_KEY"]
@@ -74,7 +74,6 @@ def load_kategori_dict() -> Dict[str, List[str]]:
             result[cat] = kws
     return result
 
-
 @st.cache_data(show_spinner=False)
 def load_persepsi() -> Tuple[List[str], List[str]]:
     """Membaca keyword persepsi dari sheet 'persepsi'."""
@@ -100,23 +99,15 @@ def load_persepsi() -> Tuple[List[str], List[str]]:
 
 @st.cache_data(show_spinner=False)
 def load_wilayah():
-    """
-    Return:
-      kab_items   : list[(name_upper, kode_kab, kode_prov)]  – for regex detection
-      prov_items  : list[(name_upper, kode_prov)]             – for regex detection
-      sorted_provs: list[(kode_prov, display_name)]           – sorted alpha, for UI
-      kab_by_prov : dict[kode_prov -> list[(display_name, kode_kab)]] – for UI
-    """
+    if not os.path.exists(WILAYAH_PATH):
+        return [], [], [], {}
     df = pd.read_excel(WILAYAH_PATH, header=0)
     df.columns = [c.strip() for c in df.columns]
 
-    # --- detection structures ---
-    kab_set: Dict[str, Tuple[str, str]] = {}   # name_upper -> (kode_kab, kode_prov)
-    prov_seen: Dict[str, str] = {}             # kode_prov  -> name_upper
-
-    # --- UI structures ---
-    prov_ui: Dict[str, str] = {}               # kode_prov -> display name (Title Case)
-    kab_ui: Dict[str, List[Tuple[str, str]]] = {}  # kode_prov -> [(display_name, kode_kab)]
+    kab_set: Dict[str, Tuple[str, str]] = {}
+    prov_seen: Dict[str, str] = {}
+    prov_ui: Dict[str, str] = {}
+    kab_ui: Dict[str, List[Tuple[str, str]]] = {}
     seen_kab_kode: Set[str] = set()
 
     for _, row in df.iterrows():
@@ -125,14 +116,12 @@ def load_wilayah():
         kode_kab   = str(int(row["KODE KAB"])).zfill(4)
         nama_kab   = str(row["NAMA KAB"]).strip()
 
-        # detection
         clean_kab = re.sub(r"^(KABUPATEN|KOTA)\s+", "", nama_kab.upper()).strip()
         for name in {nama_kab.upper(), clean_kab}:
             if len(name) >= 3:
                 kab_set[name] = (kode_kab, kode_prov)
         prov_seen.setdefault(kode_prov, nama_prov.upper())
 
-        # UI
         prov_ui.setdefault(kode_prov, nama_prov.title())
         if kode_kab not in seen_kab_kode:
             seen_kab_kode.add(kode_kab)
@@ -142,7 +131,7 @@ def load_wilayah():
                         key=lambda x: len(x[0]), reverse=True)
     prov_items = sorted([(name, kode) for kode, name in prov_seen.items()],
                         key=lambda x: len(x[0]), reverse=True)
-    sorted_provs = sorted(prov_ui.items(), key=lambda x: x[1])  # [(kode_prov, display_name)]
+    sorted_provs = sorted(prov_ui.items(), key=lambda x: x[1])
     for kp in kab_ui:
         kab_ui[kp] = sorted(kab_ui[kp], key=lambda x: x[0])
 
@@ -173,8 +162,6 @@ def parse_relative_time_to_date(text: str) -> str:
     now = datetime.now()
     text_lower = text.lower()
     
-    # Gunakan \b (word boundary) setelah setiap pola satuan waktu
-    # agar "j" tidak cocok dengan "Jul", "m" tidak cocok dengan "Mar", dll.
     m_min = re.search(r'(\d+)\s*(?:m\b|mnt\b|menit\b)', text_lower)
     if m_min and 'minggu' not in text_lower:
         return (now - dt.timedelta(minutes=int(m_min.group(1)))).strftime("%d/%m/%Y")
@@ -208,11 +195,10 @@ def clean_source_and_date(src: str, pub: str) -> Tuple[str, str]:
     _TIME_PAT = (
         r'\d+\s*'
         r'(?:jam|hour|mnt|menit|hari|day|mgg|minggu|week|bln|bulan|months?|mo|tahun|thn|years?|yr'
-        r'|[jhdwm]\b)'  # Huruf tunggal HARUS di word boundary agar tidak cocok dengan 'juta', 'meter', dll
+        r'|[jhdwm]\b)'
         r'(?:\s+yang\s+lalu|\s+ago)?'
     )
 
-    # 1. Strip waktu di AKHIR string: "Tempo.co1h", "TribunNews2thn"
     m_end = re.search(rf'({_TIME_PAT})$', src, flags=re.IGNORECASE)
     if m_end:
         time_str = m_end.group(1)
@@ -220,7 +206,6 @@ def clean_source_and_date(src: str, pub: str) -> Tuple[str, str]:
         if not pub or pub == "-":
             pub = time_str
 
-    # 2. Strip waktu di AWAL string: "9hon MSNOpinion" → "on MSNOpinion"
     m_start = re.match(rf'^({_TIME_PAT})\s*', src, flags=re.IGNORECASE)
     if m_start:
         time_str = m_start.group(1)
@@ -228,19 +213,15 @@ def clean_source_and_date(src: str, pub: str) -> Tuple[str, str]:
         if not pub or pub == "-":
             pub = time_str
 
-    # 3. Hapus "on MSN" + kata kategori opsional setelahnya: "on MSNOpinion", "on MSN"
     m_msn = re.search(r'\s*on\s+MSN\w*', src, flags=re.IGNORECASE)
     if m_msn:
         src = src[:m_msn.start()].strip()
 
-    # 4. Strip angka view/read count yang menempel: "Media Indonesia27 juta", "56 juta", "3471"
     src = re.sub(r'\s*\d+(?:[.,]\d+)?\s*(?:juta|ribu|rb|k|m)?\s*$', '', src, flags=re.IGNORECASE).strip()
 
-    # 5. Tolak jika sumber hanya angka murni
     if re.match(r'^\d+$', src.strip()):
         src = "-"
 
-    # 6. Tolak sumber terlalu pendek (< 3 karakter) — kemungkinan artefak HTML seperti "Co"
     if 0 < len(src) < 3:
         src = "-"
 
@@ -249,47 +230,24 @@ def clean_source_and_date(src: str, pub: str) -> Tuple[str, str]:
 
 
 def source_from_url(url: str) -> str:
-    """Tebak nama sumber dari domain URL sebagai fallback."""
-    if not url:
-        return "-"
+    if not url: return "-"
     try:
         from urllib.parse import urlparse
         host = urlparse(url).hostname or ""
-        # Hapus www. dan subdomain umum
         host = re.sub(r'^(www|m|mobile|amp)\.', '', host)
-        # Mapping domain terkenal ke nama yang lebih bersih
         _DOMAIN_MAP = {
-            "kompas.com":      "Kompas",
-            "detik.com":       "Detik",
-            "tribunnews.com":  "Tribun News",
-            "cnnindonesia.com":"CNN Indonesia",
-            "tempo.co":        "Tempo",
-            "liputan6.com":    "Liputan6",
-            "okezone.com":     "Okezone",
-            "republika.co.id": "Republika",
-            "jpnn.com":        "JPNN",
-            "medcom.id":       "Medcom",
-            "beritasatu.com":  "BeritaSatu",
-            "antara.news":     "Antara News",
-            "antaranews.com":  "Antara News",
-            "sindonews.com":   "Sindo News",
-            "merdeka.com":     "Merdeka",
-            "suara.com":       "Suara",
-            "bisnis.com":      "Bisnis Indonesia",
-            "msn.com":         "MSN",
-            "viva.co.id":      "VIVA",
-            "cnbcindonesia.com": "CNBC Indonesia",
-            "inews.id":        "iNews",
-            "tvonenews.com":   "tvOneNews",
-            "kumparan.com":    "Kumparan",
-            "pikiran-rakyat.com": "Pikiran Rakyat",
-            "jawapos.com":     "Jawa Pos"
+            "kompas.com": "Kompas", "detik.com": "Detik", "tribunnews.com": "Tribun News",
+            "cnnindonesia.com": "CNN Indonesia", "tempo.co": "Tempo", "liputan6.com": "Liputan6",
+            "okezone.com": "Okezone", "republika.co.id": "Republika", "jpnn.com": "JPNN",
+            "medcom.id": "Medcom", "beritasatu.com": "BeritaSatu", "antaranews.com": "Antara News",
+            "sindonews.com": "Sindo News", "merdeka.com": "Merdeka", "suara.com": "Suara",
+            "bisnis.com": "Bisnis Indonesia", "msn.com": "MSN", "viva.co.id": "VIVA",
+            "cnbcindonesia.com": "CNBC Indonesia", "inews.id": "iNews", "tvonenews.com": "tvOneNews",
+            "kumparan.com": "Kumparan", "pikiran-rakyat.com": "Pikiran Rakyat", "jawapos.com": "Jawa Pos"
         }
-        # Cek exact dan partial match
         for domain, name in _DOMAIN_MAP.items():
             if host.endswith(domain):
                 return name
-        # Fallback: ambil domain utama dan kapitalisasi
         parts = host.rsplit(".")
         if len(parts) >= 3 and parts[-2].lower() in ["co", "or", "go", "ac", "sch", "my", "biz", "web", "desa"]:
             return parts[-3].capitalize()
@@ -311,21 +269,17 @@ def format_tanggal(published: str) -> str:
         except Exception:
             pass
             
-    # Fallback to isoformat
     try:
         return datetime.fromisoformat(published.strip()).strftime("%d/%m/%Y")
     except Exception:
         pass
         
-    # Terjemahkan bulan Indonesia dan gunakan dateutil.parser untuk parse teks bebas
     try:
         from dateutil import parser
         bulan = {
             'januari': 'Jan', 'februari': 'Feb', 'maret': 'Mar', 'april': 'Apr',
             'mei': 'May', 'juni': 'Jun', 'juli': 'Jul', 'agustus': 'Aug',
-            'september': 'Sep', 'oktober': 'Oct', 'november': 'Nov', 'desember': 'Dec',
-            'jan': 'Jan', 'feb': 'Feb', 'mar': 'Mar', 'apr': 'Apr',
-            'agu': 'Aug', 'sep': 'Sep', 'okt': 'Oct', 'nov': 'Nov', 'des': 'Dec'
+            'september': 'Sep', 'oktober': 'Oct', 'november': 'Nov', 'desember': 'Dec'
         }
         date_lower = published.strip().lower()
         for id_month, en_month in bulan.items():
@@ -340,8 +294,7 @@ def format_tanggal(published: str) -> str:
 
 
 def detect_wilayah(text: str, kab_items, prov_items) -> str:
-    if not text:
-        return ""
+    if not text: return ""
     text_up = text.upper()
     found_kab: Set[str] = set()
     covered_prov: Set[str] = set()
@@ -389,8 +342,7 @@ def detect_persepsi(title: str, text: str, pos_kws: List[str], neg_kws: List[str
         return 0
 
 
-def detect_kategori(text: str, kategori_dict: Dict[str, List[str]],
-                    initial_cats: Set[str]) -> str:
+def detect_kategori(text: str, kategori_dict: Dict[str, List[str]], initial_cats: Set[str]) -> str:
     text_up = text.upper()
     matched: Set[str] = set(initial_cats)
     
@@ -422,49 +374,20 @@ def fetch_article_data(url: str) -> Dict[str, str]:
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
         }
-        # Tambahkan timeout agar tidak hang
         response = requests.get(url, headers=headers, timeout=10)
         if response.status_code == 200:
             html = response.text
-            
-            # 1. Ekstrak teks menggunakan trafilatura
             result["text"] = trafilatura.extract(html) or ""
             
-            # 2. Ekstrak tanggal sebagai fallback menggunakan BeautifulSoup
             soup = BeautifulSoup(html, 'html.parser')
-            
-            # Coba JSON-LD dulu
             for script in soup.find_all('script', {'type': 'application/ld+json'}):
                 try:
                     data = json.loads(script.string)
-                    if isinstance(data, dict):
-                        date_pub = data.get('datePublished')
-                        if date_pub:
-                            result["date"] = date_pub
-                            break
-                    elif isinstance(data, list):
-                        for item in data:
-                            if isinstance(item, dict) and item.get('datePublished'):
-                                result["date"] = item.get('datePublished')
-                                break
+                    if isinstance(data, dict) and data.get('datePublished'):
+                        result["date"] = data.get('datePublished')
+                        break
                 except Exception:
                     pass
-                if result["date"]: break
-            
-            # Coba meta tag jika JSON-LD gagal
-            if not result["date"]:
-                meta_tags = [
-                    ('meta', {'property': 'article:published_time'}, 'content'),
-                    ('meta', {'name': 'pubdate'}, 'content'),
-                    ('time', {}, 'datetime')
-                ]
-                for tag, attrs, prop in meta_tags:
-                    for el in soup.find_all(tag, attrs):
-                        val = el.get(prop)
-                        if val:
-                            result["date"] = val
-                            break
-                    if result["date"]: break
     except Exception:
         pass
     return result
@@ -474,39 +397,21 @@ def fetch_article_data(url: str) -> Dict[str, str]:
 # ============================================================
 
 _persepsi_renderer = JsCode("""
-class PersepsiRenderer {
-    init(params) {
-        this.eGui = document.createElement('span');
-        let val = params.value;
-        if (val == 1 || val == '1') {
-            this.eGui.innerHTML = '▲';
-            this.eGui.style.color = '#4CAF50';
-        } else if (val == -1 || val == '-1') {
-            this.eGui.innerHTML = '▼';
-            this.eGui.style.color = '#F44336';
-        } else {
-            this.eGui.innerHTML = '=';
-            this.eGui.style.color = '#9E9E9E';
-        }
-        this.eGui.style.fontWeight = 'bold';
-        this.eGui.style.fontSize = '16px';
-        this.eGui.style.textAlign = 'center';
-        this.eGui.style.display = 'block';
+function(params) {
+    let val = params.value;
+    if (val == 1 || val == '1') {
+        return '<span style="color:#4CAF50; font-weight:bold; font-size:16px; display:block; text-align:center;">▲</span>';
+    } else if (val == -1 || val == '-1') {
+        return '<span style="color:#F44336; font-weight:bold; font-size:16px; display:block; text-align:center;">▼</span>';
+    } else {
+        return '<span style="color:#9E9E9E; font-weight:bold; font-size:16px; display:block; text-align:center;">=</span>';
     }
-    getGui() { return this.eGui; }
 }
 """)
 
 _link_btn = JsCode("""
-class LinkRenderer {
-    init(params) {
-        this.eGui = document.createElement('a');
-        this.eGui.innerHTML = '🔗 Buka';
-        this.eGui.setAttribute('href', params.value);
-        this.eGui.setAttribute('target', '_blank');
-        this.eGui.style.cssText = 'color:#2196F3;font-weight:bold;text-decoration:none;';
-    }
-    getGui() { return this.eGui; }
+function(params) {
+    return '<a href="' + params.value + '" target="_blank" style="color:#2196F3; font-weight:bold; text-decoration:none;">🔗 Buka</a>';
 }
 """)
 
@@ -518,10 +423,8 @@ def to_excel(df: pd.DataFrame) -> bytes:
 
 
 def show_aggrid(df: pd.DataFrame):
-    # Excel uses original df (no Buka column)
     df_excel = df.reset_index(drop=True)
 
-    # Display df adds Buka button column
     df_display = df_excel.copy()
     df_display.insert(0, "Buka", df_display["URL"])
 
@@ -531,16 +434,12 @@ def show_aggrid(df: pd.DataFrame):
     gb.configure_default_column(editable=False, groupable=True, resizable=True)
     gb.configure_grid_options(enableRangeSelection=True, enableCellTextSelection=True)
     gb.configure_column("Persepsi", cellRenderer=_persepsi_renderer, width=90, type=["numericColumn"])
-    gb.configure_column("Buka", cellRenderer=_link_btn, width=90,
-                        pinned="left", suppressSizeToFit=True)
+    gb.configure_column("Buka", cellRenderer=_link_btn, width=90, pinned="left", suppressSizeToFit=True)
     gridOptions = gb.build()
 
     c1, c2 = st.columns([8, 2])
     with c1:
-        st.markdown(
-            "<h3 style='margin:0;font-size:24px;'>Hasil Scraping</h3>",
-            unsafe_allow_html=True
-        )
+        st.markdown("<h3 style='margin:0;font-size:24px;'>Hasil Scraping</h3>", unsafe_allow_html=True)
     with c2:
         fname = f"berita_lnprt_{dt.date.today().strftime('%Y%m%d')}.xlsx"
         st.download_button("⬇️ Download Excel", data=to_excel(df_excel),
@@ -557,10 +456,7 @@ def show_aggrid(df: pd.DataFrame):
 # ============================================================
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def cached_bing_search(keyword: str,
-                       start_date: dt.date,
-                       end_date: dt.date,
-                       wilayah_term: str = "") -> List[Dict]:
+def cached_bing_search(keyword: str, start_date: dt.date, end_date: dt.date, wilayah_term: str = "") -> Tuple[List[Dict], List[str]]:
     from bs4 import BeautifulSoup
     import urllib.parse
 
@@ -568,20 +464,13 @@ def cached_bing_search(keyword: str,
     errors: List[str] = []
     seen_urls: Set[str] = set()
 
-    # Build query - natural search without restrictive quotes
-    if wilayah_term:
-        q_base = f'{keyword} {wilayah_term}'.strip()
-    else:
-        q_base = keyword
-
-    # Headers to mimic real browser
+    q_base = f'{keyword} {wilayah_term}'.strip() if wilayah_term else keyword
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         'Accept-Language': 'id-ID,id;q=0.9,en;q=0.8',
     }
 
-    # Use Bing News - more reliable than Google News
     try:
         encoded_query = urllib.parse.quote(q_base)
         url = f'https://www.bing.com/news/search?q={encoded_query}&setlang=id-ID'
@@ -591,71 +480,45 @@ def cached_bing_search(keyword: str,
                 response = requests.get(url, headers=headers, timeout=15)
                 if response.status_code == 200:
                     soup = BeautifulSoup(response.text, 'html.parser')
-
-                    # Bing News article selectors
                     articles = soup.select('div.news-card, div.newsitem')
 
                     for article in articles:
                         try:
-                            # Extract title and link
                             title_elem = article.select_one('a.title, h3 a, .title a')
-                            if not title_elem:
-                                continue
+                            if not title_elem: continue
 
                             title = title_elem.text.strip()
                             link = title_elem.get('href', '')
 
-                            if not link or link in seen_urls:
-                                continue
+                            if not link or link in seen_urls: continue
 
-                            # Selalu baca teks elemen sumber Bing — untuk ekstrak tanggal relatif (misal: Detik5j)
                             src_elem = article.select_one('.source, .provider, cite')
                             src_raw = src_elem.text.strip() if src_elem else ""
 
-                            # Sumber: utamakan dari URL jika domain ada di prelist
                             src_from_url = source_from_url(link)
-                            if src_from_url != "-":
-                                src = src_from_url
-                            else:
-                                # Domain tidak dikenal — ambil dan bersihkan dari HTML Bing
-                                src, _ = clean_source_and_date(src_raw, "")
-                                if src == "-":
-                                    src = src_from_url
+                            src = src_from_url if src_from_url != "-" else clean_source_and_date(src_raw, "")[0]
 
-                            # Tanggal: cek atribut datetime dulu, lalu teks elemen date, lalu teks elemen sumber
                             published = ""
                             date_elem = article.select_one('time, .date, .timestamp')
                             if date_elem:
-                                published = (date_elem.get('datetime', '') or
-                                             date_elem.get('data-content', '') or
-                                             date_elem.text.strip())
+                                published = date_elem.get('datetime', '') or date_elem.text.strip()
 
-                            # Fallback: waktu relatif dari teks elemen sumber (misal "Detik5j" → pub="5j")
                             if not published and src_raw:
                                 _, published = clean_source_and_date(src_raw, "")
 
                             seen_urls.add(link)
                             all_entries.append({
-                                "title": title,
-                                "published": published,
-                                "link": link,
-                                "source": src
+                                "title": title, "published": published, "link": link, "source": src
                             })
                         except Exception:
                             continue
-
-                    break  # Success, exit retry loop
-
-                else:
-                    errors.append(f"Bing News HTTP {response.status_code}")
-
+                    break
             except Exception as exc:
-                if attempt == 2:  # Last attempt
+                if attempt == 2:
                     errors.append(f"Bing News: {type(exc).__name__}: {exc}")
                 time.sleep(2 ** attempt)
 
         time.sleep(DELAY_REQ)
-
     except Exception as exc:
         errors.append(f"Search error: {type(exc).__name__}: {exc}")
 
@@ -663,11 +526,6 @@ def cached_bing_search(keyword: str,
 
 
 def _strip_title_source_suffix(title: str, source_name: str) -> str:
-    """
-    RSS Google News selalu memformat title sebagai 'Judul Artikel - Nama Media'.
-    Karena nama media sudah ada terpisah di kolom source, suffix ini dibuang
-    dari judul agar tidak dobel/redundan.
-    """
     if not title or not source_name or source_name == "-":
         return title
     suffix = f" - {source_name}"
@@ -676,40 +534,21 @@ def _strip_title_source_suffix(title: str, source_name: str) -> str:
     return title
 
 
-# Daftar User-Agent berbeda untuk rotasi agar tidak terdeteksi sebagai bot
 _GNEWS_UA_LIST = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:127.0) Gecko/20100101 Firefox/127.0',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 Edg/125.0.0.0',
 ]
 
-_GNEWS_RSS_TIMEOUT = 30  # timeout lebih panjang untuk menghindari false positive timeout
-
-def _fetch_gnews_rss_day(q_base: str, day: dt.date, _retry_count: int = 5) -> Tuple[List[Dict], Optional[str]]:
-    """Ambil 1 hari RSS Google News untuk 1 query. Return (entries, error_message)."""
+def _fetch_gnews_rss_day(q_base: str, day: dt.date, _retry_count: int = 3) -> Tuple[List[Dict], Optional[str]]:
     next_day = day + dt.timedelta(days=1)
     query = f'{q_base} after:{day.strftime("%Y-%m-%d")} before:{next_day.strftime("%Y-%m-%d")}'
-    url = ("https://news.google.com/rss/search?"
-           f"q={urllib.parse.quote(query)}&hl=id&gl=ID&ceid=ID:id")
+    url = f"https://news.google.com/rss/search?q={urllib.parse.quote(query)}&hl=id&gl=ID&ceid=ID:id"
 
     entries: List[Dict] = []
-    last_exc = None
     for attempt in range(_retry_count):
-        # Rotasi User-Agent dan tambah header browser-like lengkap
-        headers = {
-            'User-Agent': _GNEWS_UA_LIST[attempt % len(_GNEWS_UA_LIST)],
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-            'Accept-Language': 'id-ID,id;q=0.9,en-US,en;q=0.8',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'Cache-Control': 'no-cache',
-            'Pragma': 'no-cache',
-            'DNT': '1',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1',
-        }
+        headers = {'User-Agent': _GNEWS_UA_LIST[attempt % len(_GNEWS_UA_LIST)]}
         try:
-            resp = requests.get(url, headers=headers, timeout=_GNEWS_RSS_TIMEOUT)
+            resp = requests.get(url, headers=headers, timeout=20)
             if resp.status_code == 200:
                 feed = feedparser.parse(resp.content)
                 for e in feed.entries:
@@ -721,82 +560,40 @@ def _fetch_gnews_rss_day(q_base: str, day: dt.date, _retry_count: int = 5) -> Tu
                     try:
                         src = e.source.title
                     except Exception:
-                        try:
-                            s = getattr(e, "source", None)
-                            if isinstance(s, dict):
-                                src = s.get("title", "-") or "-"
-                        except Exception:
-                            pass
+                        pass
 
-                    # Bersihkan suffix " - Nama Media" dari judul SEBELUM src
-                    # dimodifikasi oleh clean_source_and_date (agar suffix
-                    # yang dicocokkan persis sama dengan yang ditulis Google).
                     title = _strip_title_source_suffix(title, src)
-
                     src, published = clean_source_and_date(src, published)
 
                     if link:
-                        entries.append({"title": title, "published": published,
-                                        "link": link, "source": src})
+                        entries.append({"title": title, "published": published, "link": link, "source": src})
                 return entries, None
-            else:
-                last_exc = Exception(f"HTTP {resp.status_code}")
-                # Kalau kena 429/503 (rate limit Google), coba 1x lagi dgn delay panjang,
-                # lalu fail. Block biasanya berlangsung menit-jam, retry berkali-kali
-                # hanya buang waktu.
-                if resp.status_code in (429, 503):
-                    if attempt < 1:  # coba 1x retry
-                        delay = 15 + random.uniform(3, 7)
-                        time.sleep(delay)
-                        continue
-                    else:
-                        return entries, f"{day}: HTTP {resp.status_code} (rate limited by Google)"
-        except Exception as exc:
-            last_exc = exc
-        delay = (2 ** attempt) + random.uniform(0.5, 2)
-        time.sleep(delay)
+        except Exception:
+            pass
+        time.sleep(2 ** attempt)
 
-    return entries, f"{day}: {type(last_exc).__name__}: {last_exc}" if last_exc else None
+    return entries, f"{day}: GNews RSS Failed"
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def cached_google_search(keyword: str,
-                          start_date: dt.date,
-                          end_date: dt.date,
-                          wilayah_term: str = "") -> Tuple[List[Dict], List[str]]:
-    """
-    Google News search menggunakan RSS (news.google.com/rss/search).
-    Karena RSS Google News hanya menampilkan maksimal ±100 artikel per request,
-    rentang tanggal dipecah menjadi 1 request RSS per hari per keyword.
-    """
+def cached_google_search(keyword: str, start_date: dt.date, end_date: dt.date, wilayah_term: str = "") -> Tuple[List[Dict], List[str]]:
     all_entries: List[Dict] = []
     errors: List[str] = []
     q_base = f'{keyword} {wilayah_term}'.strip() if wilayah_term else keyword
 
-    days: List[dt.date] = []
     current = start_date
     while current <= end_date:
-        days.append(current)
-        current += dt.timedelta(days=1)
-
-    # Request HARIAN DIJALANKAN SEQUENTIAL (1 per 1) agar tidak memicu rate limit Google.
-    # Google RSS sangat sensitif terhadap parallel request — sekali kena 503,
-    # semua request selanjutnya dalam beberapa menit akan ditolak.
-    for d in days:
-        entries, err = _fetch_gnews_rss_day(q_base, d)
+        entries, err = _fetch_gnews_rss_day(q_base, current)
         all_entries.extend(entries)
-        if err:
-            errors.append(err)
-        # Jeda dengan random jitter agar pola tidak terdeteksi sebagai bot
-        time.sleep(DELAY_REQ + random.uniform(0.5, 2.5))
+        if err: errors.append(err)
+        current += dt.timedelta(days=1)
+        time.sleep(1.0)
 
     return all_entries, errors
 
 
-
 @st.cache_data(ttl=24*3600, show_spinner=False)
 def decode_url_once(link: str) -> str:
-    """Decode Google News link dengan batas waktu 10 detik."""
     import concurrent.futures as _cf
     def _do_decode():
         r = gnewsdecoder(link)
@@ -808,66 +605,29 @@ def decode_url_once(link: str) -> str:
     except Exception:
         return link
 
-
 @st.cache_data(ttl=3600, show_spinner=False)
 def cached_fetch_article_data(url: str) -> Dict[str, str]:
     return fetch_article_data(url)
 
-
-def _call_google_search_locked(
-    keyword: str, start_date: dt.date, end_date: dt.date,
-    wilayah_term: str, lock: threading.Lock
-) -> Tuple[List[Dict], List[str]]:
-    """Wrapper untuk memastikan hanya 1 request Google RSS dalam satu waktu."""
+def _call_google_search_locked(keyword: str, start_date: dt.date, end_date: dt.date, wilayah_term: str, lock: threading.Lock) -> Tuple[List[Dict], List[str]]:
     with lock:
         return cached_google_search(keyword, start_date, end_date, wilayah_term)
-
 
 # ============================================================
 # 5. MAIN SCRAPER FUNCTION
 # ============================================================
 
-def jalankan_scraper(
-    kata_kunci: Dict[str, List[str]],
-    kategori_dict: Dict[str, List[str]],
-    custom_kw_list: List[str],
-    kab_items, prov_items,
-    pos_kws: List[str],
-    neg_kws: List[str],
-    selected_cats: List[str],
-    start_date: dt.date,
-    end_date: dt.date,
-    wilayah_term: str = "",
-    per_kw_limit: int = 0,
-    decode_url: bool = True,
-    fetch_artikel: bool = True,
-    max_ws: int = 3,
-    max_wd: int = 5,
-    max_wf: int = 3,
-    via_selected: str = "Semua",
-):
-    # Determine which sources to use
-    if via_selected == "Semua":
-        sources = ["google", "bing"]
-    elif via_selected == "Google News":
-        sources = ["google"]
-    elif via_selected == "Bing News":
-        sources = ["bing"]
-    else:
-        sources = ["bing"]
+def jalankan_scraper(kata_kunci, kategori_dict, custom_kw_list, kab_items, prov_items, pos_kws, neg_kws, selected_cats, start_date, end_date, wilayah_term="", per_kw_limit=0, decode_url=True, fetch_artikel=True, max_ws=3, max_wd=5, max_wf=3, via_selected="Semua"):
+    sources = ["google", "bing"] if via_selected == "Semua" else (["google"] if via_selected == "Google News" else ["bing"])
 
-    # Build tasks: (keyword, category, source)
     tasks: List[Tuple[str, str, str]] = []
-    
     if "Custom Keyword" in selected_cats:
         for kw in custom_kw_list:
-            for src in sources:
-                tasks.append((kw, "Custom Keyword", src))
+            for src in sources: tasks.append((kw, "Custom Keyword", src))
     else:
         for cat in selected_cats:
             for kw in kata_kunci.get(cat, []):
-                for src in sources:
-                    tasks.append((kw, cat, src))
+                for src in sources: tasks.append((kw, cat, src))
 
     if not tasks:
         st.warning("Tidak ada kata kunci yang dipilih.")
@@ -875,13 +635,9 @@ def jalankan_scraper(
 
     progress = st.progress(0.0)
     status   = st.empty()
-    status.info(f"🔄 Mempersiapkan {len(tasks)} pencarian ({len(sources)} sumber, {max_ws} worker)...")
+    status.info(f"🔄 Mempersiapkan {len(tasks)} pencarian...")
 
     exclusion_list = load_exclusion_list()
-
-    # ── Step 1: Search — Google sequential, Bing paralel ──────
-    # Google RSS sangat sensitif terhadap parallel request. Gunakan semaphore
-    # agar hanya 1 request Google dalam satu waktu, di seluruh keyword.
     _google_lock = threading.Lock()
     done = 0
     by_link: Dict[str, Dict] = {}
@@ -892,7 +648,7 @@ def jalankan_scraper(
         for kw, cat, src in tasks:
             if src == "google":
                 fut = ex.submit(_call_google_search_locked, kw, start_date, end_date, wilayah_term, _google_lock)
-            elif src == "bing":
+            else:
                 fut = ex.submit(cached_bing_search, kw, start_date, end_date, wilayah_term)
             future_map[fut] = (kw, cat, src)
 
@@ -906,129 +662,53 @@ def jalankan_scraper(
                 entries = []
                 all_search_errors.append(f"[{kw}][{src}] Failed: {exc}")
 
-            # Apply per-keyword limit AFTER cache lookup
-            if per_kw_limit > 0:
-                entries = entries[:per_kw_limit]
+            if per_kw_limit > 0: entries = entries[:per_kw_limit]
 
-            # Dedup by normalized URL (strip query params)
             for e in entries:
                 raw_link = e.get("link", "") or ""
-                if is_excluded(raw_link, exclusion_list):
-                    continue
+                if is_excluded(raw_link, exclusion_list): continue
                 
-                # Filter date range
                 pub_date_str = format_tanggal(e.get("published", ""))
-                if re.match(r'\d{2}/\d{2}/\d{4}', pub_date_str):
-                    try:
-                        parsed_d = datetime.strptime(pub_date_str, "%d/%m/%Y").date()
-                        # Allow 1 day buffer for timezones
-                        if parsed_d < start_date - dt.timedelta(days=1) or parsed_d > end_date + dt.timedelta(days=1):
-                            continue
-                    except Exception:
-                        pass
-                
                 link = raw_link.split("?")[0]
-                if not link:
-                    continue
+                if not link: continue
+                
                 if link not in by_link:
                     by_link[link] = {
                         "title":     e.get("title", "-"),
                         "published": pub_date_str,
                         "source":    e.get("source", "-"),
                         "cats":      set([cat]),
-                        "keywords":  set([kw]),  # Track keywords that found this article
+                        "keywords":  set([kw]),
                     }
                 else:
                     by_link[link]["cats"].add(cat)
-                    by_link[link]["keywords"].add(kw)  # Add keyword to existing entry
+                    by_link[link]["keywords"].add(kw)
 
             done += 1
             progress.progress(done / max(1, len(tasks)))
-            status.write(f"🔎 Pencarian: {done}/{len(tasks)} selesai | "
-                         f"{len(by_link)} artikel unik")
 
     if not by_link:
         progress.empty(); status.empty()
-        has_google_503 = any("HTTP 503" in e or "HTTP 429" in e for e in all_search_errors)
-        if has_google_503:
-            st.error("⚠️ **Google News sedang memblokir permintaan otomatis** (HTTP 503). "
-                     "Coba gunakan sumber **Bing News** atau tunggu beberapa saat.")
-        if all_search_errors:
-            with st.expander("⚠️ Error detail (klik untuk lihat)"):
-                for err in all_search_errors[:20]:
-                    st.code(err)
         st.warning("Tidak ada artikel ditemukan.")
-        st.session_state.scraped_data = pd.DataFrame(
-            columns=["Tanggal", "Judul", "Sumber", "Wilayah", "Kategori", "Persepsi", "Keywords", "Hashtag", "URL"])
+        st.session_state.scraped_data = pd.DataFrame(columns=["Tanggal", "Judul", "Sumber", "Wilayah", "Kategori", "Persepsi", "Keywords", "Hashtag", "URL"])
         return
 
-    status.write(f"🔗 Total artikel unik: {len(by_link)}")
-
-    # ── Step 2: Decode URL (paralel, opsional) ────────────────────────────
     gnews_links = list(by_link.keys())
-    decoded_map: Dict[str, str] = {}
-
-    if decode_url:
-        done = 0
-        progress.progress(0.0)
-        with ThreadPoolExecutor(max_workers=max_wd) as ex:
-            future_map2 = {ex.submit(decode_url_once, ln): ln for ln in gnews_links}
-            for fut in as_completed(future_map2, timeout=None):
-                ln = future_map2[fut]
-                try:
-                    decoded_map[ln] = fut.result(timeout=12)  # Max 12 detik per URL
-                except Exception:
-                    decoded_map[ln] = ln  # Fallback ke link asli jika timeout/error
-                done += 1
-                progress.progress(done / max(1, len(gnews_links)))
-                status.write(f"🔓 Decode URL: {done}/{len(gnews_links)}...")
-    else:
-        decoded_map = {ln: ln for ln in gnews_links}
-
-    # ── Step 3: Fetch teks artikel (paralel, opsional) ────────────────────
-    data_map: Dict[str, Dict[str, str]] = {}
-    real_urls = [decoded_map[ln] for ln in gnews_links]
-
-    if fetch_artikel:
-        done = 0
-        progress.progress(0.0)
-        with ThreadPoolExecutor(max_workers=max_wf) as ex:
-            future_map3 = {ex.submit(cached_fetch_article_data, url): url for url in real_urls}
-            for fut in as_completed(future_map3):
-                url = future_map3[fut]
-                try:
-                    data_map[url] = fut.result()
-                except Exception:
-                    data_map[url] = {"text": "", "date": ""}
-                done += 1
-                progress.progress(done / max(1, len(real_urls)))
-                status.write(f"📄 Fetch data artikel: {done}/{len(real_urls)}...")
-    else:
-        data_map = {url: {"text": "", "date": ""} for url in real_urls}
-
-    # ── Step 4: Build records ─────────────────────────────────────────────
+    decoded_map = {ln: decode_url_once(ln) if decode_url else ln for ln in gnews_links}
+    
     records = []
     for gnews_link, obj in by_link.items():
         real_url = decoded_map.get(gnews_link, gnews_link)
-        art_data = data_map.get(real_url, {"text": "", "date": ""})
-        art_text = art_data["text"]
-        full_text = obj["title"] + " " + art_text
+        art_data = cached_fetch_article_data(real_url) if fetch_artikel else {"text": "", "date": ""}
+        full_text = obj["title"] + " " + art_data["text"]
 
         wilayah  = detect_wilayah(full_text, kab_items, prov_items)
         kategori = detect_kategori(full_text, kategori_dict, obj["cats"])
-        persepsi = detect_persepsi(obj["title"], art_text, pos_kws, neg_kws, fetch_artikel)
+        persepsi = detect_persepsi(obj["title"], art_data["text"], pos_kws, neg_kws, fetch_artikel)
 
-        # Fallback date dari scrape artikel jika kosong atau "-"
         published = obj["published"]
         if (not published or published == "-") and art_data.get("date"):
             published = format_tanggal(art_data["date"])
-
-        # Keywords: join all keywords that found this article
-        keywords_str = ", ".join(sorted(obj["keywords"]))
-
-        # Hashtags: extract from full text
-        hashtags = re.findall(r'#\w+', full_text)
-        hashtags_str = ", ".join(sorted(set(hashtags))) if hashtags else ""
 
         records.append({
             "Tanggal":  published,
@@ -1037,8 +717,8 @@ def jalankan_scraper(
             "Wilayah":  wilayah,
             "Kategori": kategori,
             "Persepsi": persepsi,
-            "Keywords": keywords_str,
-            "Hashtag":  hashtags_str,
+            "Keywords": ", ".join(sorted(obj["keywords"])),
+            "Hashtag":  ", ".join(sorted(set(re.findall(r'#\w+', full_text)))),
             "URL":      real_url,
         })
 
@@ -1051,118 +731,6 @@ def jalankan_scraper(
 # 6. STREAMLIT UI
 # ============================================================
 
-# ── CSS ───────────────────────────────────────────────────────────────────
-st.markdown("""
-<style>
-    /* Biarkan header bawaan Streamlit tetap ada agar menu Settings (titik tiga) bisa diklik,
-       tapi buat transparan agar custom header kita di belakangnya terlihat. */
-    header[data-testid="stHeader"] { 
-        background: transparent !important; 
-        z-index: 999999 !important;
-    }
-    
-    div[data-testid="stMarkdownContainer"] p { margin-bottom: 4px !important; }
-    div[role="radiogroup"] { margin-top: -12px !important; }
-    
-    /* Beri jarak lebih atas pada konten agar tidak tertutup sticky header */
-    .block-container { padding-top: 100px !important; }
-    
-    div[data-baseweb="input"], div[data-baseweb="datepicker"],
-    div[data-baseweb="select"] > div {
-        height: 50px !important; min-height: 38px !important;
-        border-radius: 6px !important; 
-        padding: 4px 10px !important;
-        display: flex; align-items: center;
-        font-size: 14px !important; line-height: 1.4 !important;
-    }
-    
-    div.stButton > button {
-        background: #2196F3 !important; color: #FFF !important;
-        border-radius: 6px !important; border: none; padding: 8px 18px !important;
-    }
-    div.stButton > button:hover { background: #1565C0 !important; }
-    div.stDownloadButton > button {
-        background-color: #2196F3; color: white; font-weight: bold;
-        border-radius: 8px; padding: 0.5em 1em;
-    }
-    div.stDownloadButton > button:hover { background-color: #1565C0; }
-
-    /* Sembunyikan toolbar Streamlit (hamburger, github, dll) di mobile */
-    @media (max-width: 768px) {
-        [data-testid="stToolbar"],
-        [data-testid="stToolbarActions"],
-        #MainMenu {
-            display: none !important;
-        }
-    }
-</style>
-""", unsafe_allow_html=True)
-
-# ── Logo & Judul di Top Navigation Pane ──────────────────────────────────
-encoded_logo = ""
-if os.path.exists(LOGO_PATH):
-    with open(LOGO_PATH, "rb") as f:
-        encoded_logo = base64.b64encode(f.read()).decode()
-
-logo_html = f'<img src="data:image/png;base64,{encoded_logo}" class="header-logo">' if encoded_logo else ""
-
-st.markdown(f"""
-<style>
-    .header-logo {{
-        height: 60px;
-        position: absolute;
-        left: 20px;
-    }}
-    .header-title-container {{
-        text-align: center;
-        padding: 0 10px;
-    }}
-    .header-title {{
-        font-size: 30px;
-        font-weight: bold;
-        line-height: 1.1;
-    }}
-    .header-subtitle {{
-        font-size: 14px;
-        color: gray;
-    }}
-    
-    @media (max-width: 768px) {{
-        .header-logo {{
-            display: none !important;
-        }}
-        .header-title {{
-            font-size: 22px !important;
-        }}
-        .header-subtitle {{
-            font-size: 11px !important;
-        }}
-    }}
-</style>
-<div style="
-    position: fixed;
-    top: 0;
-    left: 0;
-    width: 100%;
-    height: 80px;
-    background-color: var(--background-color, #FFF);
-    color: var(--text-color, #000);
-    z-index: 99999;
-    border-bottom: 3px solid #e7dfdd;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    box-shadow: 0 2px 4px rgba(0,0,0,0.05);
-">
-    {logo_html}
-    <div class="header-title-container">
-        <div class="header-title">BERITA LNPRT</div>
-        <div class="header-subtitle">Scraper Berita Lembaga Non-Profit yang Melayani Rumah Tangga</div>
-    </div>
-</div>
-""", unsafe_allow_html=True)
-
-# ── Load referensi ────────────────────────────────────────────────────────
 with st.spinner("Memuat data referensi..."):
     kata_kunci = load_kata_kunci()
     kategori_dict = load_kategori_dict()
@@ -1171,170 +739,61 @@ with st.spinner("Memuat data referensi..."):
 
 semua_kategori = list(kata_kunci.keys())
 
-# ── Filter Section ────────────────────────────────────────────────────────
 with st.container(border=True):
-    # Baris 1: Kategori, Provinsi, Kab/Kota
     col_kat, col_prov, col_kab = st.columns(3)
-    
     with col_kat:
-        st.markdown("**Kategori**")
-        cat_options = ["Semua", "Custom Keyword"] + semua_kategori
-        selected_cat = st.selectbox(
-            "Pilih kategori", cat_options,
-            label_visibility="collapsed",
-            key="selected_cat"
-        )
-        
+        selected_cat = st.selectbox("Pilih kategori", ["Semua", "Custom Keyword"] + semua_kategori)
     with col_prov:
-        st.markdown("**Provinsi**")
-        prov_display_list = ["Semua"] + [name for _, name in sorted_provs]
-        selected_prov_name = st.selectbox(
-            "Pilih provinsi", prov_display_list,
-            label_visibility="collapsed",
-            key="selected_prov"
-        )
-        
+        selected_prov_name = st.selectbox("Pilih provinsi", ["Semua"] + [name for _, name in sorted_provs])
     with col_kab:
-        st.markdown("**Kabupaten/Kota**")
         if selected_prov_name == "Semua":
             kab_display_list = ["—"]
             kab_disabled = True
         else:
-            selected_kode_prov = next(
-                (k for k, n in sorted_provs if n == selected_prov_name), None
-            )
+            selected_kode_prov = next((k for k, n in sorted_provs if n == selected_prov_name), None)
             kab_list = kab_by_prov.get(selected_kode_prov, [])
             kab_display_list = ["Semua"] + [n for n, _ in kab_list]
             kab_disabled = False
+        selected_kab_name = st.selectbox("Pilih kab/kota", kab_display_list, disabled=kab_disabled)
 
-        selected_kab_name = st.selectbox(
-            "Pilih kab/kota", kab_display_list,
-            label_visibility="collapsed",
-            key="selected_kab",
-            disabled=kab_disabled
-        )
-
-    st.markdown("<br/>", unsafe_allow_html=True)
-    
     if selected_cat == "Custom Keyword":
-        custom_kw_str = st.text_input("📝 Masukkan custom keyword (pisahkan dengan koma)", placeholder="contoh: bansor sumatera, banjir sumatera")
-        st.caption("💡 *Pastikan Anda menekan **Enter** di keyboard setelah mengetik agar keyword tersimpan sebelum klik Mulai Scraping.*")
+        custom_kw_str = st.text_input("📝 Masukkan custom keyword (pisahkan dengan koma)")
         custom_kw_list = [k.strip() for k in custom_kw_str.split(",") if k.strip()]
     else:
         custom_kw_list = []
-        
-    if selected_cat == "Semua":
-        selected_cats = semua_kategori
-    elif selected_cat == "Custom Keyword":
-        selected_cats = ["Custom Keyword"]
-    else:
-        selected_cats = [selected_cat]
-        
-    # Baris 2: Tanggal, Sumber, Limit
+
+    selected_cats = semua_kategori if selected_cat == "Semua" else ([selected_cat] if selected_cat != "Custom Keyword" else ["Custom Keyword"])
+
     col_tgl, col_src, col_limit = st.columns(3)
-    
     with col_tgl:
-        st.markdown("**Periode Tanggal**")
-        today         = dt.date.today()
-        default_start = today - dt.timedelta(days=30)
-        periode = st.date_input(
-            "Periode Tanggal",
-            label_visibility="collapsed",
-            key="Tanggal",
-            value=(default_start, today),
-            format="DD/MM/YYYY"
-        )
-        if isinstance(periode, tuple) and len(periode) == 2:
-            start_date, end_date = periode
-        else:
-            st.error("⚠️ Harap pilih rentang tanggal.")
-            start_date, end_date = default_start, today
-
+        today = dt.date.today()
+        periode = st.date_input("Periode Tanggal", value=(today - dt.timedelta(days=30), today))
+        start_date, end_date = periode if isinstance(periode, tuple) and len(periode) == 2 else (today - dt.timedelta(days=30), today)
     with col_src:
-        st.markdown("**Sumber Berita**")
-        _via_options = ["Semua", "Google News", "Bing News"]
-        _via_selected = st.selectbox(
-            "Sumber Berita",
-            _via_options,
-            index=0,
-            label_visibility="collapsed",
-            key="via_select"
-        )
-
+        _via_selected = st.selectbox("Sumber Berita", ["Semua", "Google News", "Bing News"])
     with col_limit:
-        st.markdown("**Limit artikel per keyword**")
-        _limit_map = {"Tidak Terbatas": 0, "5": 5, "10": 10, "25": 25, "50": 50, "100": 100}
-        _limit_label = st.selectbox(
-            "Limit", list(_limit_map.keys()),
-            label_visibility="collapsed", key="limit_select"
-        )
-        per_kw_limit = _limit_map[_limit_label]
+        per_kw_limit = st.selectbox("Limit", [0, 5, 10, 25, 50, 100], format_func=lambda x: "Tidak Terbatas" if x == 0 else str(x))
 
-    st.markdown("<br/>", unsafe_allow_html=True)
-    
-    # Baris 3: Opsi Checkbox
-    st.markdown("**Opsi Tambahan**")
     col_opt1, col_opt2 = st.columns(2)
-    with col_opt1:
-        decode_url_toggle  = st.checkbox("🔓 Decode URL asli", value=True)
-    with col_opt2:
-        fetch_teks_toggle  = st.checkbox("📄 Fetch teks artikel *(akurat, lebih lambat)*", value=False)
+    with col_opt1: decode_url_toggle = st.checkbox("🔓 Decode URL asli", value=True)
+    with col_opt2: fetch_teks_toggle = st.checkbox("📄 Fetch teks artikel", value=False)
 
-# ── Wilayah term untuk keyword pencarian ─────────────────────────────────
-if selected_prov_name == "Semua":
-    wilayah_term = ""                          # tidak ada filter wilayah
-elif selected_kab_name in ("Semua", "—", None):
-    wilayah_term = selected_prov_name          # hanya nama provinsi
-else:
-    wilayah_term = selected_kab_name           # nama kab/kota saja
+wilayah_term = "" if selected_prov_name == "Semua" else (selected_prov_name if selected_kab_name in ("Semua", "—", None) else selected_kab_name)
 
-# ── Info pencarian ────────────────────────────────────────────────────────
-total_kw = sum(len(kata_kunci.get(c, [])) for c in selected_cats)
-wilayah_info = f"**{wilayah_term}**" if wilayah_term else "Seluruh Indonesia"
-st.caption(
-    f"📌 Kategori: **{selected_cat}** | {total_kw} kata kunci | "
-    f"Wilayah: {wilayah_info} | Sumber: **{_via_selected}**"
-)
+scrape_button = st.button("🔍 Mulai Scraping", use_container_width=True)
 
-# ── Tombol scraping ───────────────────────────────────────────────────────
-st.markdown("")
-_, col_btn, _ = st.columns([4, 3, 4])
-with col_btn:
-    scrape_button = st.button("🔍 Mulai Scraping", use_container_width=True)
-
-# ── Init session state ────────────────────────────────────────────────────
 if "scraped_data" not in st.session_state:
-    st.session_state.scraped_data = pd.DataFrame(
-        columns=["Tanggal", "Judul", "Sumber", "Wilayah", "Kategori", "Persepsi", "Keywords", "Hashtag", "URL"])
+    st.session_state.scraped_data = pd.DataFrame(columns=["Tanggal", "Judul", "Sumber", "Wilayah", "Kategori", "Persepsi", "Keywords", "Hashtag", "URL"])
 
-# ── Jalankan scraper ──────────────────────────────────────────────────────
 if scrape_button:
-    if not selected_cats or (selected_cat == "Custom Keyword" and not custom_kw_list):
-        st.warning("Pilih minimal satu kategori atau masukkan custom keyword.")
-    else:
-        jalankan_scraper(
-            kata_kunci=kata_kunci,
-            kategori_dict=kategori_dict,
-            custom_kw_list=custom_kw_list,
-            kab_items=kab_items,
-            prov_items=prov_items,
-            pos_kws=pos_kws,
-            neg_kws=neg_kws,
-            selected_cats=selected_cats,
-            start_date=start_date,
-            end_date=end_date,
-            wilayah_term=wilayah_term,
-            per_kw_limit=per_kw_limit,
-            decode_url=decode_url_toggle,
-            fetch_artikel=fetch_teks_toggle,
-            max_ws=5,   # Ditingkatkan dari 3 ke 5 (Pencarian lebih cepat)
-            max_wd=15,  # Ditingkatkan dari 5 ke 15 (Dekode link Google super cepat)
-            max_wf=8,   # Ditingkatkan dari 3 ke 8 (Download konten artikel lebih paralel)
-            via_selected=_via_selected,
-        )
+    jalankan_scraper(
+        kata_kunci, kategori_dict, custom_kw_list, kab_items, prov_items,
+        pos_kws, neg_kws, selected_cats, start_date, end_date,
+        wilayah_term, per_kw_limit, decode_url_toggle, fetch_teks_toggle,
+        via_selected=_via_selected
+    )
 
-# ── Tampilkan hasil ───────────────────────────────────────────────────────
 if not st.session_state.scraped_data.empty:
     show_aggrid(st.session_state.scraped_data)
 else:
-    st.info("Belum ada data. Pilih kategori dan periode, lalu klik **Mulai Scraping**.")
+    st.info("Belum ada data. Klik **Mulai Scraping** untuk memulai.")
