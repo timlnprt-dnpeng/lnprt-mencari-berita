@@ -8,6 +8,8 @@ import time
 import re
 import os
 import base64
+import warnings
+warnings.filterwarnings("ignore", module="requests")
 import pandas as pd
 import datetime as dt
 from datetime import datetime
@@ -684,7 +686,7 @@ _GNEWS_UA_LIST = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 Edg/125.0.0.0',
 ]
 
-_GNEWS_RSS_TIMEOUT = 30  # timeout lebih panjang untuk menghindari false positive timeout
+_GNEWS_RSS_TIMEOUT = 15  # timeout per request (dari 30 → 15 agar stop lebih responsif)
 
 def _fetch_gnews_rss_day(q_base: str, day: dt.date, _retry_count: int = 5) -> Tuple[List[Dict], Optional[str]]:
     """Ambil 1 hari RSS Google News untuk 1 query. Return (entries, error_message)."""
@@ -709,7 +711,7 @@ def _fetch_gnews_rss_day(q_base: str, day: dt.date, _retry_count: int = 5) -> Tu
             'Upgrade-Insecure-Requests': '1',
         }
         try:
-            resp = requests.get(url, headers=headers, timeout=_GNEWS_RSS_TIMEOUT)
+            resp = requests.get(url, headers=headers, timeout=(10, _GNEWS_RSS_TIMEOUT))
             if resp.status_code == 200:
                 feed = feedparser.parse(resp.content)
                 for e in feed.entries:
@@ -794,19 +796,92 @@ def cached_google_search(keyword: str,
 
 
 
+def _decode_gnews_url(source_url: str) -> Optional[str]:
+    """
+    Decode URL Google News sendiri (tanpa library googlenewsdecoder yg tidak
+    punya timeout & headers). Mengikuti algoritma yang sama:
+    1. Ekstrak base64 dari URL
+    2. Fetch halaman article untuk dapat signature & timestamp
+    3. POST ke batchexecute untuk dapat decoded URL
+    """
+    from urllib.parse import urlparse
+    import json as _json
+
+    # Step 1: Extract base64
+    parsed = urlparse(source_url)
+    path_parts = parsed.path.split("/")
+    if parsed.hostname != "news.google.com" or len(path_parts) < 2 or path_parts[-2] not in ("articles", "read"):
+        return None
+    base64_str = path_parts[-1]
+
+    # Headers browser-like untuk semua request
+    _headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Accept-Language': 'id-ID,id;q=0.9,en-US,en;q=0.8',
+        'Cache-Control': 'no-cache',
+        'DNT': '1',
+        'Connection': 'keep-alive',
+    }
+
+    # Step 2: Get signature & timestamp dari halaman article
+    try:
+        art_url = f"https://news.google.com/articles/{base64_str}"
+        resp = requests.get(art_url, headers=_headers, timeout=(10, 12))
+        if resp.status_code != 200:
+            # fallback ke format /rss/articles/
+            art_url = f"https://news.google.com/rss/articles/{base64_str}"
+            resp = requests.get(art_url, headers=_headers, timeout=(10, 12))
+        resp.raise_for_status()
+    except Exception:
+        return None
+
+    # Parse signature & timestamp dari HTML
+    import re as _re
+    sig = ts = None
+    # Cari data-n-a-sg dan data-n-a-ts di HTML
+    m_sg = _re.search(r'data-n-a-sg="([^"]+)"', resp.text)
+    m_ts = _re.search(r'data-n-a-ts="([^"]+)"', resp.text)
+    if m_sg and m_ts:
+        sig, ts = m_sg.group(1), m_ts.group(1)
+    else:
+        return None
+
+    # Step 3: POST ke batchexecute
+    try:
+        batch_url = "https://news.google.com/_/DotsSplashUi/data/batchexecute"
+        payload = [
+            "Fbv4je",
+            f'["garturlreq",[["X","X",["X","X"],null,null,1,1,"US:en",null,1,null,null,null,null,null,0,1],"X","X",1,[1,1,1],1,1,null,0,0,null,0],"{base64_str}",{ts},"{sig}"]',
+        ]
+        post_headers = {
+            "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+            "User-Agent": _headers["User-Agent"],
+        }
+        post_resp = requests.post(
+            batch_url,
+            headers=post_headers,
+            data=f"f.req={urllib.parse.quote(_json.dumps([[payload]]))}",
+            timeout=15,
+        )
+        post_resp.raise_for_status()
+
+        parsed_data = _json.loads(post_resp.text.split("\n\n")[1])[:-2]
+        decoded_url = _json.loads(parsed_data[0][2])[1]
+        return decoded_url
+    except Exception:
+        return None
+
+
 @st.cache_data(ttl=24*3600, show_spinner=False)
 def decode_url_once(link: str) -> str:
-    """Decode Google News link dengan batas waktu 10 detik."""
-    import concurrent.futures as _cf
-    def _do_decode():
-        r = gnewsdecoder(link)
-        return r["decoded_url"] if r.get("status") else link
-    try:
-        with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
-            fut = _ex.submit(_do_decode)
-            return fut.result(timeout=10)
-    except Exception:
-        return link
+    """Decode Google News link dengan retry & timeout sendiri."""
+    for attempt in range(3):
+        result = _decode_gnews_url(link)
+        if result:
+            return result
+        time.sleep(2 ** attempt + random.uniform(0.5, 1.5))
+    return link  # fallback ke URL asli
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -967,6 +1042,7 @@ def jalankan_scraper(
     # ── Step 2: Decode URL (paralel, opsional) ────────────────────────────
     gnews_links = list(by_link.keys())
     decoded_map: Dict[str, str] = {}
+    decode_fail_count = 0
 
     if decode_url:
         done = 0
@@ -976,12 +1052,21 @@ def jalankan_scraper(
             for fut in as_completed(future_map2, timeout=None):
                 ln = future_map2[fut]
                 try:
-                    decoded_map[ln] = fut.result(timeout=12)  # Max 12 detik per URL
+                    decoded = fut.result(timeout=12)
+                    decoded_map[ln] = decoded
+                    if decoded == ln and "news.google.com" in ln:
+                        decode_fail_count += 1
                 except Exception:
                     decoded_map[ln] = ln  # Fallback ke link asli jika timeout/error
+                    decode_fail_count += 1
                 done += 1
                 progress.progress(done / max(1, len(gnews_links)))
                 status.write(f"🔓 Decode URL: {done}/{len(gnews_links)}...")
+
+        # Jika mayoritas gagal decode, tampilkan warning
+        if decode_fail_count > len(gnews_links) * 0.5:
+            st.warning(f"⚠️ {decode_fail_count}/{len(gnews_links)} URL Google News gagal didecode "
+                       "(Google memblokir otomatis). URL asli tetap dipakai sebagai fallback.")
     else:
         decoded_map = {ln: ln for ln in gnews_links}
 
