@@ -1,5 +1,6 @@
 streamlit
 googlenewsdecoder
+selectolax<1.0
 trafilatura
 pandas
 openpyxl
