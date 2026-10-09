@@ -18,10 +18,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
 import threading
 import random
+import tempfile
 import requests
 import feedparser
 import urllib.parse
-from googlenewsdecoder import gnewsdecoder
 from st_aggrid import AgGrid, GridOptionsBuilder, JsCode
 
 # ── Konfigurasi halaman ──────────────────────────────────────────────────────
@@ -38,10 +38,32 @@ UMUM       = "Umum"
 DELAY_REQ  = 3  # Detik delay antar request untuk hindari blokir
 MAX_WORKERS = 5  # Worker paralel (Streamlit Cloud: 2 vCPUs)
 
+# API key TIDAK ditulis di kode. Isi lewat Streamlit Cloud: App settings -> Secrets
+#   NEWS_API_KEY = "isi_key_anda"
+# atau lewat environment variable NEWS_API_KEY. (Saat ini belum dipakai di kode.)
 try:
     NEWS_API_KEY = st.secrets["NEWS_API_KEY"]
 except Exception:
-    NEWS_API_KEY = "xxxxx"
+    NEWS_API_KEY = os.environ.get("NEWS_API_KEY", "")
+
+RESULT_COLS = ["Tanggal", "Judul", "Sumber", "Wilayah", "Kategori",
+               "Persepsi", "Keywords", "Hashtag", "URL"]
+CHECKPOINT_PATH = os.path.join(tempfile.gettempdir(), "lnprt_checkpoint.csv")
+
+# Sinyal henti: dipakai agar thread pencarian ikut berhenti kalau proses dibatalkan/terputus
+_STOP_EVENT = threading.Event()
+
+
+class _CancelOnExit(ThreadPoolExecutor):
+    """ThreadPoolExecutor yang langsung membatalkan antrean kalau blok `with`
+    keluar karena error/stop (bawaan-nya menunggu SEMUA tugas antre selesai,
+    yang bisa berjam-jam)."""
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type is not None:
+            _STOP_EVENT.set()
+            self.shutdown(wait=False, cancel_futures=True)
+            return False
+        return super().__exit__(exc_type, exc, tb)
 
 # ============================================================
 # 1. LOAD DATA REFERENSI
@@ -562,7 +584,7 @@ def show_aggrid(df: pd.DataFrame):
 def cached_bing_search(keyword: str,
                        start_date: dt.date,
                        end_date: dt.date,
-                       wilayah_term: str = "") -> List[Dict]:
+                       wilayah_term: str = "") -> Tuple[List[Dict], List[str]]:
     from bs4 import BeautifulSoup
     import urllib.parse
 
@@ -765,7 +787,8 @@ def _fetch_gnews_rss_day(q_base: str, day: dt.date, _retry_count: int = 5) -> Tu
 def cached_google_search(keyword: str,
                           start_date: dt.date,
                           end_date: dt.date,
-                          wilayah_term: str = "") -> Tuple[List[Dict], List[str]]:
+                          wilayah_term: str = "",
+                          max_articles: int = 0) -> Tuple[List[Dict], List[str]]:
     """
     Google News search menggunakan RSS (news.google.com/rss/search).
     Karena RSS Google News hanya menampilkan maksimal ±100 artikel per request,
@@ -784,11 +807,32 @@ def cached_google_search(keyword: str,
     # Request HARIAN DIJALANKAN SEQUENTIAL (1 per 1) agar tidak memicu rate limit Google.
     # Google RSS sangat sensitif terhadap parallel request — sekali kena 503,
     # semua request selanjutnya dalam beberapa menit akan ditolak.
+    # Kalau ada limit, mulai dari hari TERBARU dan berhenti begitu limit tercapai
+    # (hemat banyak request). Tanpa limit, ambil semua hari.
+    if max_articles > 0:
+        days = list(reversed(days))
+
+    consecutive_rate_limited = 0
     for d in days:
+        if _STOP_EVENT.is_set():
+            # Dilempar sebagai error agar hasil parsial TIDAK tersimpan di cache
+            raise RuntimeError("Pencarian dibatalkan")
         entries, err = _fetch_gnews_rss_day(q_base, d)
         all_entries.extend(entries)
         if err:
             errors.append(err)
+            if "rate limited" in err:
+                consecutive_rate_limited += 1
+            else:
+                consecutive_rate_limited = 0
+            # Google sudah memblokir: lanjut per hari hanya buang waktu
+            if consecutive_rate_limited >= 3:
+                errors.append(f"{keyword}: dihentikan karena Google membatasi permintaan (3x berturut-turut)")
+                break
+        else:
+            consecutive_rate_limited = 0
+        if max_articles > 0 and len(all_entries) >= max_articles:
+            break
         # Jeda dengan random jitter agar pola tidak terdeteksi sebagai bot
         time.sleep(DELAY_REQ + random.uniform(0.5, 2.5))
 
@@ -891,16 +935,36 @@ def cached_fetch_article_data(url: str) -> Dict[str, str]:
 
 def _call_google_search_locked(
     keyword: str, start_date: dt.date, end_date: dt.date,
-    wilayah_term: str, lock: threading.Lock
+    wilayah_term: str, lock: threading.Lock, max_articles: int = 0
 ) -> Tuple[List[Dict], List[str]]:
     """Wrapper untuk memastikan hanya 1 request Google RSS dalam satu waktu."""
     with lock:
-        return cached_google_search(keyword, start_date, end_date, wilayah_term)
+        if _STOP_EVENT.is_set():
+            raise RuntimeError("Pencarian dibatalkan")
+        return cached_google_search(keyword, start_date, end_date, wilayah_term, max_articles)
 
 
 # ============================================================
 # 5. MAIN SCRAPER FUNCTION
 # ============================================================
+
+def _simpan_sementara(by_link: Dict[str, Dict]) -> None:
+    """Simpan hasil sementara (tanpa deteksi wilayah/persepsi) ke session_state
+    dan file checkpoint, supaya tidak hilang kalau proses terputus."""
+    if not by_link:
+        return
+    rows = [{
+        "Tanggal":  o["published"], "Judul": o["title"], "Sumber": o["source"],
+        "Wilayah":  "", "Kategori": ", ".join(sorted(o["cats"])), "Persepsi": 0,
+        "Keywords": ", ".join(sorted(o["keywords"])), "Hashtag": "", "URL": link,
+    } for link, o in by_link.items()]
+    df = pd.DataFrame(rows, columns=RESULT_COLS)
+    st.session_state.scraped_data = df
+    try:
+        df.to_csv(CHECKPOINT_PATH, index=False)
+    except Exception:
+        pass
+
 
 def jalankan_scraper(
     kata_kunci: Dict[str, List[str]],
@@ -953,6 +1017,7 @@ def jalankan_scraper(
     status.info(f"🔄 Mempersiapkan {len(tasks)} pencarian ({len(sources)} sumber, {max_ws} worker)...")
 
     exclusion_list = load_exclusion_list()
+    _STOP_EVENT.clear()
 
     # ── Step 1: Search — Google sequential, Bing paralel ──────
     # Google RSS sangat sensitif terhadap parallel request. Gunakan semaphore
@@ -962,65 +1027,78 @@ def jalankan_scraper(
     by_link: Dict[str, Dict] = {}
     all_search_errors: List[str] = []
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        future_map = {}
-        for kw, cat, src in tasks:
-            if src == "google":
-                fut = ex.submit(_call_google_search_locked, kw, start_date, end_date, wilayah_term, _google_lock)
-            elif src == "bing":
-                fut = ex.submit(cached_bing_search, kw, start_date, end_date, wilayah_term)
-            future_map[fut] = (kw, cat, src)
+    search_completed = False
+    try:
+        with _CancelOnExit(max_workers=MAX_WORKERS) as ex:
+            future_map = {}
+            for kw, cat, src in tasks:
+                if src == "google":
+                    fut = ex.submit(_call_google_search_locked, kw, start_date, end_date, wilayah_term, _google_lock, per_kw_limit)
+                elif src == "bing":
+                    fut = ex.submit(cached_bing_search, kw, start_date, end_date, wilayah_term)
+                future_map[fut] = (kw, cat, src)
 
-        for fut in as_completed(future_map):
-            kw, cat, src = future_map[fut]
-            try:
-                entries, errs = fut.result()
-                entries = entries or []
-                all_search_errors.extend([f"[{kw}][{src}] {e}" for e in errs])
-            except Exception as exc:
-                entries = []
-                all_search_errors.append(f"[{kw}][{src}] Failed: {exc}")
+            for fut in as_completed(future_map):
+                kw, cat, src = future_map[fut]
+                try:
+                    entries, errs = fut.result()
+                    entries = entries or []
+                    all_search_errors.extend([f"[{kw}][{src}] {e}" for e in errs])
+                except Exception as exc:
+                    entries = []
+                    all_search_errors.append(f"[{kw}][{src}] Failed: {exc}")
 
-            # Apply per-keyword limit AFTER cache lookup
-            if per_kw_limit > 0:
-                entries = entries[:per_kw_limit]
+                # Apply per-keyword limit AFTER cache lookup
+                if per_kw_limit > 0:
+                    entries = entries[:per_kw_limit]
 
-            # Dedup by normalized URL (strip query params)
-            for e in entries:
-                raw_link = e.get("link", "") or ""
-                if is_excluded(raw_link, exclusion_list):
-                    continue
+                # Dedup by normalized URL (strip query params)
+                for e in entries:
+                    raw_link = e.get("link", "") or ""
+                    if is_excluded(raw_link, exclusion_list):
+                        continue
                 
-                # Filter date range
-                pub_date_str = format_tanggal(e.get("published", ""))
-                if re.match(r'\d{2}/\d{2}/\d{4}', pub_date_str):
-                    try:
-                        parsed_d = datetime.strptime(pub_date_str, "%d/%m/%Y").date()
-                        # Allow 1 day buffer for timezones
-                        if parsed_d < start_date - dt.timedelta(days=1) or parsed_d > end_date + dt.timedelta(days=1):
-                            continue
-                    except Exception:
-                        pass
+                    # Filter date range
+                    pub_date_str = format_tanggal(e.get("published", ""))
+                    if re.match(r'\d{2}/\d{2}/\d{4}', pub_date_str):
+                        try:
+                            parsed_d = datetime.strptime(pub_date_str, "%d/%m/%Y").date()
+                            # Allow 1 day buffer for timezones
+                            if parsed_d < start_date - dt.timedelta(days=1) or parsed_d > end_date + dt.timedelta(days=1):
+                                continue
+                        except Exception:
+                            pass
                 
-                link = raw_link.split("?")[0]
-                if not link:
-                    continue
-                if link not in by_link:
-                    by_link[link] = {
-                        "title":     e.get("title", "-"),
-                        "published": pub_date_str,
-                        "source":    e.get("source", "-"),
-                        "cats":      set([cat]),
-                        "keywords":  set([kw]),  # Track keywords that found this article
-                    }
-                else:
-                    by_link[link]["cats"].add(cat)
-                    by_link[link]["keywords"].add(kw)  # Add keyword to existing entry
+                    link = raw_link.split("?")[0]
+                    if not link:
+                        continue
+                    if link not in by_link:
+                        by_link[link] = {
+                            "title":     e.get("title", "-"),
+                            "published": pub_date_str,
+                            "source":    e.get("source", "-"),
+                            "cats":      set([cat]),
+                            "keywords":  set([kw]),  # Track keywords that found this article
+                        }
+                    else:
+                        by_link[link]["cats"].add(cat)
+                        by_link[link]["keywords"].add(kw)  # Add keyword to existing entry
 
-            done += 1
-            progress.progress(done / max(1, len(tasks)))
-            status.write(f"🔎 Pencarian: {done}/{len(tasks)} selesai | "
-                         f"{len(by_link)} artikel unik")
+                done += 1
+                if done % 3 == 0:
+                    _simpan_sementara(by_link)
+                progress.progress(done / max(1, len(tasks)))
+                status.write(f"🔎 Pencarian: {done}/{len(tasks)} selesai | "
+                             f"{len(by_link)} artikel unik")
+        search_completed = True
+    finally:
+        try:
+            _simpan_sementara(by_link)
+            if not search_completed:
+                st.warning(f"⏹️ Proses terhenti sebelum selesai. {len(by_link)} artikel "
+                           "yang sudah terkumpul disimpan sebagai hasil sementara.")
+        except BaseException:
+            pass  # jangan menutupi error/stop aslinya
 
     if not by_link:
         progress.empty(); status.empty()
@@ -1047,7 +1125,7 @@ def jalankan_scraper(
     if decode_url:
         done = 0
         progress.progress(0.0)
-        with ThreadPoolExecutor(max_workers=max_wd) as ex:
+        with _CancelOnExit(max_workers=max_wd) as ex:
             future_map2 = {ex.submit(decode_url_once, ln): ln for ln in gnews_links}
             for fut in as_completed(future_map2, timeout=None):
                 ln = future_map2[fut]
@@ -1077,7 +1155,7 @@ def jalankan_scraper(
     if fetch_artikel:
         done = 0
         progress.progress(0.0)
-        with ThreadPoolExecutor(max_workers=max_wf) as ex:
+        with _CancelOnExit(max_workers=max_wf) as ex:
             future_map3 = {ex.submit(cached_fetch_article_data, url): url for url in real_urls}
             for fut in as_completed(future_map3):
                 url = future_map3[fut]
@@ -1129,6 +1207,10 @@ def jalankan_scraper(
 
     df = pd.DataFrame(records)
     st.session_state.scraped_data = df
+    try:
+        df.to_csv(CHECKPOINT_PATH, index=False)
+    except Exception:
+        pass
     progress.empty(); status.empty()
     st.success(f"✅ Selesai! {len(df)} artikel terproses.")
 
@@ -1417,6 +1499,14 @@ if scrape_button:
             max_wf=8,   # Ditingkatkan dari 3 ke 8 (Download konten artikel lebih paralel)
             via_selected=_via_selected,
         )
+
+# ── Muat hasil sementara (kalau sesi sebelumnya terputus) ─────────────────
+if st.session_state.scraped_data.empty and os.path.exists(CHECKPOINT_PATH):
+    if st.button("♻️ Muat hasil sementara terakhir"):
+        try:
+            st.session_state.scraped_data = pd.read_csv(CHECKPOINT_PATH).fillna("")
+        except Exception as exc:
+            st.error(f"Gagal memuat hasil sementara: {exc}")
 
 # ── Tampilkan hasil ───────────────────────────────────────────────────────
 if not st.session_state.scraped_data.empty:
